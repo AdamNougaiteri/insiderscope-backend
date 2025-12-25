@@ -1,71 +1,104 @@
-import { XMLParser } from 'fast-xml-parser';
+import { XMLParser } from "fast-xml-parser";
 
-const parser = new XMLParser({ ignoreAttributes: false });
+const SEC_FEED =
+  "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&owner=only&count=40&output=atom";
 
-const SEC_HEADERS = {
-  'User-Agent': 'InsiderScope demo contact@example.com',
-  'Accept': 'application/xml,text/xml'
+const HEADERS = {
+  "User-Agent": "InsiderScope demo contact@example.com",
+  Accept: "application/xml",
 };
 
-// Simple in-memory cache (Vercel-safe)
-let cache = [];
-let lastFetch = 0;
-const CACHE_MS = 15 * 60 * 1000;
+const parser = new XMLParser({
+  ignoreAttributes: false,
+  attributeNamePrefix: "",
+});
+
+// --- helpers --------------------------------------------------
+
+function cleanText(v) {
+  if (!v) return "";
+  return String(v).replace(/\s+/g, " ").trim();
+}
+
+function parseNumber(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function extractCompanyAndTicker(raw) {
+  if (!raw) return { companyName: "Unknown", ticker: "UNKNOWN" };
+
+  // Example raw values seen in Form 4 titles
+  // "4 - ONDAS HOLDINGS INC (0001646188)"
+  // "4 - IonQ, Inc. (0001824920)"
+
+  const cleaned = cleanText(raw);
+
+  // remove leading "4 -"
+  const noPrefix = cleaned.replace(/^4\s*-\s*/i, "");
+
+  // remove (CIK)
+  const companyOnly = noPrefix.replace(/\(\d+\)/g, "").trim();
+
+  return {
+    companyName: companyOnly || "Unknown",
+    ticker: "UNKNOWN", // real ticker resolution comes later
+  };
+}
+
+// --- main handler --------------------------------------------
 
 export default async function handler(req, res) {
   try {
-    // Return cached data if still valid
-    if (Date.now() - lastFetch < CACHE_MS && cache.length > 0) {
-      return res.status(200).json(cache);
-    }
+    const r = await fetch(SEC_FEED, { headers: HEADERS });
+    if (!r.ok) throw new Error(`SEC error ${r.status}`);
 
-    const feedUrl =
-      'https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&owner=only&output=atom';
+    const xml = await r.text();
+    const feed = parser.parse(xml);
 
-    const feedRes = await fetch(feedUrl, {
-      headers: SEC_HEADERS
-    });
+    const entries = Array.isArray(feed.feed.entry)
+      ? feed.feed.entry
+      : [feed.feed.entry];
 
-    if (!feedRes.ok) {
-      throw new Error(`SEC feed error: ${feedRes.status}`);
-    }
+    const transactions = [];
 
-    const xmlText = await feedRes.text();
-    const parsed = parser.parse(xmlText);
+    for (const e of entries) {
+      const title = cleanText(e.title);
+      const summary = cleanText(e.summary);
 
-    const entries = parsed?.feed?.entry || [];
-    const results = [];
+      // Only purchases
+      if (!summary.includes("Transaction: P")) continue;
 
-    for (const entry of entries.slice(0, 15)) {
-      const title = entry.title || '';
-      // Example title format:
-      // "NVIDIA CORP - HUANG JEN-HSUN (NVDA)"
-      const match = title.match(/^(.*?) - (.*?) \((.*?)\)/);
+      const { companyName, ticker } = extractCompanyAndTicker(title);
 
-      if (!match) continue;
+      const sharesMatch = summary.match(/Shares:\s*([\d,]+)/i);
+      const priceMatch = summary.match(/Price:\s*\$?([\d.]+)/i);
 
-      const shares = Math.floor(Math.random() * 50000) + 500;
-      const price = Math.round((Math.random() * 500 + 20) * 100) / 100;
+      const shares = parseNumber(
+        sharesMatch ? sharesMatch[1].replace(/,/g, "") : 0
+      );
+      const pricePerShare = parseNumber(priceMatch ? priceMatch[1] : 0);
+      const totalValue = shares * pricePerShare;
 
-      results.push({
-        id: entry.id,
-        companyName: match[1],
-        insiderName: match[2],
-        ticker: match[3],
-        insiderTitle: 'Insider',
+      transactions.push({
+        id: e.id || crypto.randomUUID(),
+        companyName,
+        ticker,
+        insiderName: cleanText(e.author?.name),
+        insiderTitle: "Insider",
         shares,
-        pricePerShare: price,
-        totalValue: shares * price,
-        transactionDate: entry.updated
+        pricePerShare,
+        totalValue,
+        transactionDate: e.updated,
       });
     }
 
-    cache = results;
-    lastFetch = Date.now();
+    // sort by largest buys
+    transactions.sort((a, b) => b.totalValue - a.totalValue);
 
-    res.status(200).json(results);
-  } catch (error) {
-    console.error('insider-buys error:', error);
-    res.status(500).json({ error: 'Failed to fetch insider data' });
+    res.status(200).json(transactions);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to load insider buys" });
   }
 }
