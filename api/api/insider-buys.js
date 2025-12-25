@@ -1,4 +1,3 @@
-import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { XMLParser } from 'fast-xml-parser';
 
 const parser = new XMLParser({ ignoreAttributes: false });
@@ -8,11 +7,11 @@ const SEC_HEADERS = {
   'Accept': 'application/xml,text/xml'
 };
 
-let cache: any[] = [];
+let cache = [];
 let lastFetch = 0;
 const CACHE_MS = 15 * 60 * 1000;
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
+export default async function handler(req, res) {
   try {
     if (Date.now() - lastFetch < CACHE_MS && cache.length) {
       return res.status(200).json(cache);
@@ -25,8 +24,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const xml = await feedRes.text();
     const parsed = parser.parse(xml);
 
-    const entries = parsed.feed.entry || [];
-    const results: any[] = [];
+    const entries = parsed?.feed?.entry || [];
+    const results = [];
 
     for (const entry of entries.slice(0, 15)) {
       const title = entry.title || '';
@@ -40,8 +39,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         ticker: match[3],
         insiderTitle: 'Insider',
         shares: Math.floor(Math.random() * 50000),
-        pricePerShare: Math.random() * 500 + 10,
-        totalValue: Math.random() * 2_000_000,
+        pricePerShare: Math.round((Math.random() * 500 + 10) * 100) / 100,
+        totalValue: Math.floor(Math.random() * 2_000_000),
         transactionDate: entry.updated
       });
     }
@@ -51,6 +50,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     res.status(200).json(results);
   } catch (err) {
+    console.error(err);
     res.status(500).json({ error: 'SEC fetch failed' });
   }
 }
