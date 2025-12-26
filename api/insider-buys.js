@@ -1,74 +1,65 @@
 export default async function handler(req, res) {
   try {
-    const SEC_HEADERS = {
-      "User-Agent": "InsiderScope demo contact@example.com",
-      Accept: "application/xml",
+    const headers = {
+      "User-Agent": "InsiderScope research (contact@insiderscope.app)",
+      "Accept-Encoding": "gzip, deflate",
     };
 
-    // 1. Pull latest Form 4 feed (raw XML)
-    const feedRes = await fetch(
-      "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&owner=only&count=20&output=atom",
-      { headers: SEC_HEADERS }
+    // 1. Get latest insider submissions
+    const submissionsRes = await fetch(
+      "https://data.sec.gov/submissions/CIK0000320193.json",
+      { headers }
     );
 
-    const feedText = await feedRes.text();
+    if (!submissionsRes.ok) {
+      return res.status(500).json({ error: "Failed to fetch submissions" });
+    }
 
-    // 2. Extract accession numbers + CIKs from links
-    const entryRegex =
-      /https:\/\/www\.sec\.gov\/Archives\/edgar\/data\/(\d+)\/(\d{18})\//g;
+    const submissions = await submissionsRes.json();
+    const recentForms = submissions.filings.recent;
 
-    const matches = [...feedText.matchAll(entryRegex)];
+    const form4s = [];
+    for (let i = 0; i < recentForms.form.length; i++) {
+      if (recentForms.form[i] === "4") {
+        form4s.push({
+          accession: recentForms.accessionNumber[i],
+          filingDate: recentForms.filingDate[i],
+        });
+      }
+    }
 
+    // Limit for safety
+    const limited = form4s.slice(0, 5);
     const results = [];
 
-    // 3. Process a few filings (keep it light for Vercel)
-    for (const match of matches.slice(0, 5)) {
-      const cik = match[1];
-      const accession = match[2];
-      const accessionDashed = accession.replace(
-        /(\d{10})(\d{2})(\d{6})/,
-        "$1-$2-$3"
-      );
+    // 2. Fetch each Form 4 XML and extract issuer + owner
+    for (const f of limited) {
+      const acc = f.accession.replace(/-/g, "");
+      const cik = "0000320193"; // Apple CIK for testing
 
-      const filingUrl = `https://www.sec.gov/Archives/edgar/data/${cik}/${accession}/${accessionDashed}.xml`;
+      const xmlUrl = `https://www.sec.gov/Archives/edgar/data/${cik}/${acc}/${f.accession}.xml`;
+      const xmlRes = await fetch(xmlUrl, { headers });
 
-      const filingRes = await fetch(filingUrl, {
-        headers: SEC_HEADERS,
-      });
+      if (!xmlRes.ok) continue;
+      const xml = await xmlRes.text();
 
-      if (!filingRes.ok) continue;
-
-      const xml = await filingRes.text();
-
-      // 4. Only BUY transactions (P)
-
-      const get = (tag) => {
-        const m = xml.match(new RegExp(`<${tag}>(.*?)</${tag}>`));
-        return m ? m[1] : null;
-      };
-
-      const shares = Number(get("transactionShares")) || 0;
-      const price = Number(get("transactionPricePerShare")) || 0;
-
-      if (!shares || !price) continue;
+      // VERY loose parsing — just prove data exists
+      const issuerMatch = xml.match(/<issuerName>(.*?)<\/issuerName>/);
+      const ownerMatch = xml.match(/<rptOwnerName>(.*?)<\/rptOwnerName>/);
 
       results.push({
-        id: accessionDashed,
-        companyName: get("issuerName") || "Unknown",
-        ticker: get("issuerTradingSymbol") || "UNKNOWN",
-        insiderName: get("rptOwnerName") || "Unknown Insider",
-        insiderTitle: "Insider",
-        shares,
-        pricePerShare: price,
-        totalValue: shares * price,
-        transactionDate: get("transactionDate") || null,
+        id: f.accession,
+        companyName: issuerMatch ? issuerMatch[1] : "Unknown Issuer",
+        insiderName: ownerMatch ? ownerMatch[1] : "Unknown Insider",
+        filingDate: f.filingDate,
+        source: "SEC Form 4 XML",
       });
     }
 
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.status(200).json(results);
+    return res.status(200).json(results);
+
   } catch (err) {
-    console.error("Insider buy fetch failed:", err);
-    res.status(500).json([]);
+    console.error("INSIDER API ERROR:", err);
+    return res.status(500).json({ error: "Internal server error" });
   }
 }
