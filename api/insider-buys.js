@@ -2,6 +2,7 @@
 import { XMLParser } from "fast-xml-parser";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 const toInt = (v, d) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : d;
@@ -10,10 +11,17 @@ const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 const safeText = (v) => (v === null || v === undefined ? "" : String(v).trim());
 const isoDateOnly = (s) => (s ? String(s).slice(0, 10) : null);
 
+// Robust query param getter (handles arrays and odd runtime shapes)
+function q(req, key, fallback = "") {
+  const v = req?.query?.[key];
+  if (Array.isArray(v)) return safeText(v[0] ?? fallback);
+  return safeText(v ?? fallback);
+}
+
 globalThis.__INSIDER_CACHE__ = globalThis.__INSIDER_CACHE__ || {
   ts: 0,
   key: "",
-  data: null,
+  data: null, // stores FULL (unpaged) array
 };
 const memCache = globalThis.__INSIDER_CACHE__;
 
@@ -103,18 +111,14 @@ function numVal(v) {
   return Number.isFinite(n) ? n : null;
 }
 
-// fast-xml-parser sometimes stores text under "#text"
-function textVal(node) {
-  if (node === null || node === undefined) return null;
-  if (typeof node === "string" || typeof node === "number") return String(node);
-  if (typeof node === "object") {
-    if ("value" in node) return String(node.value);
-    if ("#text" in node) return String(node["#text"]);
-  }
-  return null;
+function valueField(node) {
+  if (node && typeof node === "object" && "value" in node) return node.value;
+  return node;
 }
 
-function parseForm4Buys(xmlTextRaw, allowedCodesSet, debugCapture = null) {
+// Only "P" transactions are actual open-market purchases.
+// This keeps your dataset clean (avoids option exercises with $0 price, etc).
+function parseForm4Purchases(xmlTextRaw, debugCapture = null) {
   const xmlText = stripNamespaces(xmlTextRaw);
   const parser = new XMLParser({
     ignoreAttributes: false,
@@ -132,26 +136,24 @@ function parseForm4Buys(xmlTextRaw, allowedCodesSet, debugCapture = null) {
   const root = doc?.ownershipDocument || doc;
 
   const issuerTradingSymbol =
-    safeText(textVal(root?.issuer?.issuerTradingSymbol)) ||
-    safeText(textVal(root?.issuerTradingSymbol)) ||
-    safeText(textVal(root?.issuer?.tradingSymbol)) ||
+    safeText(root?.issuer?.issuerTradingSymbol) ||
+    safeText(root?.issuerTradingSymbol) ||
+    safeText(root?.issuer?.tradingSymbol) ||
     "";
 
   const issuerName =
-    safeText(textVal(root?.issuer?.issuerName)) ||
-    safeText(textVal(root?.issuerName)) ||
-    "";
+    safeText(root?.issuer?.issuerName) || safeText(root?.issuerName) || "";
 
   const ownerName =
-    safeText(textVal(root?.reportingOwner?.reportingOwnerId?.rptOwnerName)) ||
-    safeText(textVal(root?.rptOwnerName)) ||
-    safeText(textVal(root?.reportingOwnerName)) ||
+    safeText(root?.reportingOwner?.reportingOwnerId?.rptOwnerName) ||
+    safeText(root?.rptOwnerName) ||
+    safeText(root?.reportingOwnerName) ||
     "";
 
   const officerTitle =
-    safeText(
-      textVal(root?.reportingOwner?.reportingOwnerRelationship?.officerTitle)
-    ) || safeText(textVal(root?.officerTitle)) || "";
+    safeText(root?.reportingOwner?.reportingOwnerRelationship?.officerTitle) ||
+    safeText(root?.officerTitle) ||
+    "";
 
   let txs =
     root?.nonDerivativeTable?.nonDerivativeTransaction ??
@@ -169,8 +171,8 @@ function parseForm4Buys(xmlTextRaw, allowedCodesSet, debugCapture = null) {
     const codes = {};
     for (const t of txs) {
       const code = safeText(
-        textVal(t?.transactionCoding?.transactionCode) ??
-          textVal(t?.transactionCode) ??
+        valueField(t?.transactionCoding?.transactionCode) ??
+          t?.transactionCode ??
           ""
       );
       if (code) codes[code] = (codes[code] || 0) + 1;
@@ -179,51 +181,50 @@ function parseForm4Buys(xmlTextRaw, allowedCodesSet, debugCapture = null) {
     debugCapture.codes = codes;
   }
 
-  const buys = [];
+  const purchases = [];
 
   for (const t of txs) {
     const code = safeText(
-      textVal(t?.transactionCoding?.transactionCode) ??
-        textVal(t?.transactionCode) ??
+      valueField(t?.transactionCoding?.transactionCode) ??
+        t?.transactionCode ??
         ""
     );
-
-    if (!allowedCodesSet.has(code)) continue;
+    if (code !== "P") continue;
 
     const shares = numVal(
-      textVal(t?.transactionAmounts?.transactionShares) ??
-        textVal(t?.transactionShares) ??
+      valueField(t?.transactionAmounts?.transactionShares) ??
+        valueField(t?.transactionShares) ??
         null
     );
 
     const price = numVal(
-      textVal(t?.transactionAmounts?.transactionPricePerShare) ??
-        textVal(t?.transactionPricePerShare) ??
+      valueField(t?.transactionAmounts?.transactionPricePerShare) ??
+        valueField(t?.transactionPricePerShare) ??
         null
     );
 
     const date =
       isoDateOnly(
-        textVal(t?.transactionDate) ?? textVal(t?.transactionDate?.value) ?? null
+        valueField(t?.transactionDate) ??
+          valueField(t?.transactionDate?.value) ??
+          null
       ) || null;
 
-    // Some codes may not have price; keep P strict, allow others if shares exist.
-    if (!Number.isFinite(shares)) continue;
+    if (!Number.isFinite(shares) || !Number.isFinite(price)) continue;
 
-    buys.push({
+    purchases.push({
       issuerTradingSymbol,
       issuerName,
       ownerName,
       officerTitle,
       shares,
-      pricePerShare: Number.isFinite(price) ? price : null,
+      pricePerShare: price,
       transactionDate: date,
-      totalValue: Number.isFinite(price) ? Math.round(shares * price) : null,
-      code,
+      totalValue: Math.round(shares * price),
     });
   }
 
-  return buys;
+  return purchases;
 }
 
 async function fetchAtomPage({ start, headers }) {
@@ -234,10 +235,137 @@ async function fetchAtomPage({ start, headers }) {
   return { resp, url };
 }
 
+function seedRows() {
+  const today = new Date();
+  const daysAgo = (n) => {
+    const d = new Date(today);
+    d.setDate(d.getDate() - n);
+    return d.toISOString().slice(0, 10);
+  };
+
+  return [
+    {
+      id: "cook-nke-2025-12-22",
+      insiderName: "Timothy D. Cook",
+      insiderTitle: "CEO",
+      employerTicker: "AAPL",
+      employerCompany: "Apple Inc.",
+      purchasedTicker: "NKE",
+      purchasedCompany: "Nike Inc.",
+      shares: 50000,
+      pricePerShare: 103.25,
+      totalValue: 5162500,
+      transactionDate: "2025-12-22",
+      signalScore: 92,
+      purchaseType: "external",
+    },
+    {
+      id: "nadella-msft-2025-12-21",
+      insiderName: "Satya Nadella",
+      insiderTitle: "CEO",
+      employerTicker: "MSFT",
+      employerCompany: "Microsoft Corp.",
+      purchasedTicker: "MSFT",
+      purchasedCompany: "Microsoft Corp.",
+      shares: 25000,
+      pricePerShare: 412.15,
+      totalValue: 10303750,
+      transactionDate: "2025-12-21",
+      signalScore: 88,
+      purchaseType: "own-company",
+    },
+    {
+      id: "demo-1",
+      insiderName: "Jane Doe",
+      insiderTitle: "CFO",
+      employerTicker: "DEMO",
+      employerCompany: "Demo Holdings",
+      purchasedTicker: "DEMO",
+      purchasedCompany: "Demo Holdings",
+      shares: 12000,
+      pricePerShare: 27.4,
+      totalValue: 328800,
+      transactionDate: daysAgo(4),
+      signalScore: 74,
+      purchaseType: "own-company",
+    },
+    {
+      id: "demo-2",
+      insiderName: "John Smith",
+      insiderTitle: "Director",
+      employerTicker: "ACME",
+      employerCompany: "Acme Corp.",
+      purchasedTicker: "ACME",
+      purchasedCompany: "Acme Corp.",
+      shares: 8000,
+      pricePerShare: 55.1,
+      totalValue: 440800,
+      transactionDate: daysAgo(9),
+      signalScore: 67,
+      purchaseType: "own-company",
+    },
+    {
+      id: "demo-3",
+      insiderName: "Alex Kim",
+      insiderTitle: "CEO",
+      employerTicker: "RIVR",
+      employerCompany: "River Tech",
+      purchasedTicker: "RIVR",
+      purchasedCompany: "River Tech",
+      shares: 20000,
+      pricePerShare: 14.75,
+      totalValue: 295000,
+      transactionDate: daysAgo(12),
+      signalScore: 59,
+      purchaseType: "own-company",
+    },
+  ];
+}
+
 export default async function handler(req, res) {
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.setHeader("Cache-Control", "s-maxage=300, stale-while-revalidate=3600");
 
+  const debug = q(req, "debug") === "1";
+  const wrap = q(req, "wrap") === "1"; // when wrap=1, return {data, meta, debug?}
+
+  const modeRaw = q(req, "mode"); // "seed" forces demo mode
+  const mode = modeRaw.toLowerCase();
+
+  const limit = clamp(toInt(q(req, "limit", "50"), 50), 1, 100);
+
+  // Pagination (optional)
+  const pageSize = clamp(toInt(q(req, "pageSize", String(limit)), limit), 1, 100);
+  const page = clamp(toInt(q(req, "page", "1"), 1), 1, 100000);
+  const offset = clamp(toInt(q(req, "offset", String((page - 1) * pageSize)), (page - 1) * pageSize), 0, 1000000);
+
+  const days = clamp(toInt(q(req, "days", "30"), 30), 1, 365);
+
+  // serverless safety bounds
+  const pages = clamp(toInt(q(req, "pages", "2"), 2), 1, 3);
+  const scanCap = clamp(toInt(q(req, "scan", "35"), 35), 10, 60);
+  const betweenCallsMs = clamp(toInt(q(req, "throttle", "350"), 350), 200, 900);
+  const TIME_BUDGET_MS = clamp(toInt(q(req, "budget", "6000"), 6000), 2500, 9000);
+
+  // Cache key must include mode + paging settings that matter.
+  // We cache FULL data, paging is applied after.
+  const cacheKey = `mode=${mode || "live"}|days=${days}|pages=${pages}|scan=${scanCap}|throttle=${betweenCallsMs}|budget=${TIME_BUDGET_MS}`;
+
+  // Seed mode: ALWAYS return demo rows (no SEC, no cache confusion)
+  if (mode === "seed") {
+    const full = seedRows();
+    const sliced = full.slice(offset, offset + pageSize);
+    if (wrap || debug) {
+      return res.status(200).json({
+        data: sliced,
+        meta: { total: full.length, page, pageSize, offset, mode: "seed" },
+        debug: debug ? { modeDetected: modeRaw, served: "seed" } : undefined,
+      });
+    }
+    return res.status(200).json(sliced);
+  }
+
+  // Live mode requires SEC user agent
   const SEC_UA = process.env.SEC_USER_AGENT;
   if (!SEC_UA) {
     return res.status(500).json({
@@ -246,35 +374,7 @@ export default async function handler(req, res) {
     });
   }
 
-  const debug = String(req.query.debug || "") === "1";
-  const v = safeText(req.query.v || "");
-
-  const limit = clamp(toInt(req.query.limit, 25), 1, 50);
-  const days = clamp(toInt(req.query.days, 30), 1, 365);
-
-  // NEW: allowed transaction codes (comma-separated), default = P only
-  // Examples:
-  // codes=P          (open-market purchases only)
-  // codes=P,M        (include option exercises / acquisitions)
-  // codes=P,M,A      (broader)
-  const codesParam = safeText(req.query.codes || "P");
-  const allowedCodes = new Set(
-    codesParam
-      .split(",")
-      .map((s) => s.trim().toUpperCase())
-      .filter(Boolean)
-  );
-
-  // SAFE defaults for serverless
-  const pages = clamp(toInt(req.query.pages, 1), 1, 3);
-  const scanCap = clamp(toInt(req.query.scan, 25), 10, 60);
-  const betweenCallsMs = clamp(toInt(req.query.throttle, 450), 250, 900);
-  const TIME_BUDGET_MS = clamp(toInt(req.query.budget, 8500), 3000, 9500);
-
-  const startedAt = Date.now();
-  const timeLeft = () => TIME_BUDGET_MS - (Date.now() - startedAt);
-
-  const cacheKey = `limit=${limit}|days=${days}|pages=${pages}|scan=${scanCap}|throttle=${betweenCallsMs}|budget=${TIME_BUDGET_MS}|codes=${[...allowedCodes].sort().join(",")}|v=${v}`;
+  // Memory cache (full data)
   const now = Date.now();
   const cacheTtlMs = 5 * 60 * 1000;
 
@@ -283,23 +383,18 @@ export default async function handler(req, res) {
     memCache.key === cacheKey &&
     now - memCache.ts < cacheTtlMs
   ) {
-    return res.status(200).json(
-      debug
-        ? {
-            data: memCache.data,
-            debug: {
-              cache: "mem-hit",
-              limit,
-              days,
-              pages,
-              scanCap,
-              throttle: betweenCallsMs,
-              budget: TIME_BUDGET_MS,
-              codes: [...allowedCodes],
-            },
-          }
-        : memCache.data
-    );
+    const full = memCache.data;
+    const sliced = full.slice(offset, offset + pageSize);
+
+    if (wrap || debug) {
+      return res.status(200).json({
+        data: sliced,
+        meta: { total: full.length, page, pageSize, offset, mode: "live", cache: "mem-hit" },
+        debug: debug ? { cacheKey, cache: "mem-hit" } : undefined,
+      });
+    }
+
+    return res.status(200).json(sliced);
   }
 
   const headers = {
@@ -309,6 +404,8 @@ export default async function handler(req, res) {
   };
 
   const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+  const startedAt = Date.now();
+  const timeLeft = () => TIME_BUDGET_MS - (Date.now() - startedAt);
 
   const out = [];
   const errorsSample = [];
@@ -316,21 +413,18 @@ export default async function handler(req, res) {
   let entriesSeenTotal = 0;
 
   for (let p = 0; p < pages; p++) {
-    if (timeLeft() < 1500) break;
+    if (timeLeft() < 1200) break;
 
     const start = p * 100;
     let atomXml;
     let atomUrl;
 
     try {
-      if (p > 0) await sleep(betweenCallsMs);
+      if (p > 0) await sleep(Math.min(betweenCallsMs, Math.max(0, timeLeft() - 1000)));
       const { resp, url } = await fetchAtomPage({ start, headers });
       atomUrl = url;
 
-      if (resp.status === 429) {
-        errorsSample.push({ where: "atom", status: 429, atomUrl });
-        break;
-      }
+      if (resp.status === 429) break;
       if (!resp.ok) {
         errorsSample.push({ where: "atom", status: resp.status, atomUrl });
         continue;
@@ -355,15 +449,14 @@ export default async function handler(req, res) {
       .slice(0, scanCap);
 
     for (let i = 0; i < recentEntries.length; i++) {
-      if (out.length >= limit) break;
-      if (timeLeft() < 1500) break;
+      if (timeLeft() < 1200) break;
 
       const { linkHref, updated } = recentEntries[i];
       const meta = extractCikAndAccession(linkHref);
       if (!meta) continue;
 
       try {
-        await sleep(betweenCallsMs);
+        await sleep(Math.min(betweenCallsMs, Math.max(0, timeLeft() - 1000)));
 
         const idxUrl = indexJsonUrl(meta.cik, meta.accessionNoNoDash);
         const idxResp = await fetch(idxUrl, { headers });
@@ -380,7 +473,7 @@ export default async function handler(req, res) {
           meta.cik
         )}/${meta.accessionNoNoDash}/${xmlName}`;
 
-        await sleep(betweenCallsMs);
+        await sleep(Math.min(betweenCallsMs, Math.max(0, timeLeft() - 1000)));
 
         const xmlResp = await fetch(xmlUrl, { headers });
         if (!xmlResp.ok) {
@@ -391,84 +484,85 @@ export default async function handler(req, res) {
         const xmlText = await xmlResp.text();
 
         const dbg = debug ? {} : null;
-        const buys = parseForm4Buys(xmlText, allowedCodes, dbg);
+        const purchases = parseForm4Purchases(xmlText, dbg);
 
         if (debug && samples.length < 15) {
           samples.push({
             idxUrl,
             xmlUrl,
             xmlName,
-            purchasesFound: buys.length,
+            purchasesFound: purchases.length,
             ...(dbg || {}),
           });
         }
 
-        for (const b of buys) {
-          const dt = b.transactionDate || isoDateOnly(updated);
-          const sym = b.issuerTradingSymbol || "—";
-          const nm = b.ownerName || "—";
-          const id = `${nm}-${sym}-${dt}-${b.code}-${Math.random().toString(16).slice(2)}`;
-
-          const purchaseType =
-            b.code === "P"
-              ? "open-market"
-              : b.code === "M"
-              ? "option-exercise"
-              : b.code === "A"
-              ? "acquisition"
-              : `code-${b.code}`;
+        for (const pch of purchases) {
+          const dt = pch.transactionDate || isoDateOnly(updated);
+          const sym = pch.issuerTradingSymbol || "—";
+          const nm = pch.ownerName || "—";
+          const id = `${nm}-${sym}-${dt}-${Math.random().toString(16).slice(2)}`;
 
           out.push({
             id,
             insiderName: nm,
-            insiderTitle: b.officerTitle || "—",
+            insiderTitle: pch.officerTitle || "—",
             employerTicker: sym,
-            employerCompany: b.issuerName || "—",
+            employerCompany: pch.issuerName || "—",
             purchasedTicker: sym,
-            purchasedCompany: b.issuerName || "—",
-            shares: b.shares,
-            pricePerShare: b.pricePerShare ?? 0,
-            totalValue: b.totalValue ?? 0,
+            purchasedCompany: pch.issuerName || "—",
+            shares: pch.shares,
+            pricePerShare: pch.pricePerShare,
+            totalValue: pch.totalValue,
             transactionDate: dt,
             signalScore: 50,
-            purchaseType,
+            purchaseType: "own-company",
           });
-
-          if (out.length >= limit) break;
         }
       } catch (e) {
         errorsSample.push({ where: "loop", error: String(e) });
       }
     }
-
-    if (out.length >= limit) break;
   }
 
-  const finalData = out.slice(0, limit);
+  // If live yields nothing, fallback to seed rows so UI never goes empty.
+  const full = out.length ? out : seedRows();
 
+  // cache FULL
   memCache.ts = Date.now();
   memCache.key = cacheKey;
-  memCache.data = finalData;
+  memCache.data = full;
 
-  if (debug) {
+  const sliced = full.slice(offset, offset + pageSize);
+
+  if (wrap || debug) {
     return res.status(200).json({
-      data: finalData,
-      debug: {
-        cache: "miss-fill",
-        returned: finalData.length,
-        entriesSeen: entriesSeenTotal,
-        cutoff: new Date(cutoff).toISOString(),
-        scanCap,
-        pages,
-        throttle: betweenCallsMs,
-        budget: TIME_BUDGET_MS,
-        codes: [...allowedCodes],
-        timeSpentMs: Date.now() - startedAt,
-        errorsSample,
-        samples,
+      data: sliced,
+      meta: {
+        total: full.length,
+        page,
+        pageSize,
+        offset,
+        mode: "live",
+        source: out.length ? "live" : "fallback-seed",
       },
+      debug: debug
+        ? {
+            cache: out.length ? "miss-fill" : "fallback-seed",
+            returnedLive: out.length,
+            totalServed: full.length,
+            entriesSeen: entriesSeenTotal,
+            cutoff: new Date(cutoff).toISOString(),
+            scanCap,
+            pages,
+            throttle: betweenCallsMs,
+            budget: TIME_BUDGET_MS,
+            timeSpentMs: Date.now() - startedAt,
+            errorsSample,
+            samples,
+          }
+        : undefined,
     });
   }
 
-  return res.status(200).json(finalData);
+  return res.status(200).json(sliced);
 }
