@@ -10,6 +10,13 @@ const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 const safeText = (v) => (v === null || v === undefined ? "" : String(v).trim());
 const isoDateOnly = (s) => (s ? String(s).slice(0, 10) : null);
 
+// --- NEW: normalize/pad CIK ---
+function normCik(cik) {
+  const s = safeText(cik).replace(/\D/g, "");
+  if (!s) return null;
+  return s.padStart(10, "0");
+}
+
 globalThis.__INSIDER_CACHE__ = globalThis.__INSIDER_CACHE__ || {
   ts: 0,
   key: "",
@@ -225,7 +232,7 @@ async function fetchAtomPage({ start, headers }) {
   return { resp, url };
 }
 
-// Seed rows — includes at least one cluster (multiple insiders buying same ticker)
+// Seed rows — now includes CIK
 function seedRows() {
   const today = new Date();
   const daysAgo = (n) => {
@@ -235,9 +242,10 @@ function seedRows() {
   };
 
   return [
-    // Cluster example: MSFT has 2 insiders buying within window
+    // MSFT CIK: 0000789019
     {
       id: "nadella-msft-2025-12-21",
+      cik: "0000789019",
       insiderName: "Satya Nadella",
       insiderTitle: "CEO",
       employerTicker: "MSFT",
@@ -253,6 +261,7 @@ function seedRows() {
     },
     {
       id: "hood-msft-2025-12-20",
+      cik: "0000789019",
       insiderName: "Amy Hood",
       insiderTitle: "CFO",
       employerTicker: "MSFT",
@@ -267,9 +276,10 @@ function seedRows() {
       purchaseType: "own-company",
     },
 
-    // Other sample rows
+    // AAPL CIK: 0000320193 (this row is “external NKE” but keep cik as employer company)
     {
       id: "cook-nke-2025-12-22",
+      cik: "0000320193",
       insiderName: "Timothy D. Cook",
       insiderTitle: "CEO",
       employerTicker: "AAPL",
@@ -283,8 +293,11 @@ function seedRows() {
       signalScore: 92,
       purchaseType: "external",
     },
+
+    // Demo rows (fake CIKs but non-null)
     {
       id: "demo-2",
+      cik: "0000000001",
       insiderName: "John Smith",
       insiderTitle: "Director",
       employerTicker: "ACME",
@@ -300,6 +313,7 @@ function seedRows() {
     },
     {
       id: "demo-3",
+      cik: "0000000002",
       insiderName: "Alex Kim",
       insiderTitle: "CEO",
       employerTicker: "RIVR",
@@ -318,13 +332,10 @@ function seedRows() {
 
 // Groups (“Company Clusters”) computed from returned rows
 function computeGroups(rows) {
-  // “Best-effort excluding scheduled buys” (we don't have 10b5-1 reliably here),
-  // but we can exclude obvious non-buys / exercises:
   const eligible = rows.filter((r) => {
     const type = safeText(r.purchaseType).toLowerCase();
     const price = Number(r.pricePerShare ?? 0);
     const shares = Number(r.shares ?? 0);
-    // exclude option exercises / zero-priced lines
     if (type.includes("option") || type.includes("exercise")) return false;
     if (!(price > 0) || !(shares > 0)) return false;
     return true;
@@ -371,9 +382,8 @@ function computeGroups(rows) {
   const groups = [];
   for (const [, g] of byTicker) {
     const insiderCount = g.insiderSet.size;
-    if (insiderCount < 2) continue; // requires multiple insiders
+    if (insiderCount < 2) continue;
 
-    // keep top insider lines (largest value)
     const insidersSorted = g.insiders
       .slice()
       .sort((a, b) => (b.value || 0) - (a.value || 0))
@@ -415,15 +425,12 @@ export default async function handler(req, res) {
   const mode = safeText(req.query.mode || ""); // "seed" to force demo
   const v = safeText(req.query.v || ""); // cache buster
 
-  // Pagination (used only when wrap=1)
   const pageSize = clamp(toInt(req.query.pageSize, 50), 1, 100);
   const page = clamp(toInt(req.query.page, 1), 1, 1000);
 
-  // If old clients pass limit/days:
   const limit = clamp(toInt(req.query.limit, pageSize), 1, 100);
   const days = clamp(toInt(req.query.days, 30), 1, 365);
 
-  // Live scan caps (serverless friendly)
   const pages = clamp(toInt(req.query.pages, 2), 1, 3);
   const scanCap = clamp(toInt(req.query.scan, 35), 10, 80);
   const betweenCallsMs = clamp(toInt(req.query.throttle, 350), 200, 900);
@@ -440,9 +447,9 @@ export default async function handler(req, res) {
     return res.status(200).json(memCache.data);
   }
 
-  // Seed mode (fast)
+  // Seed mode
   if (mode === "seed") {
-    const all = seedRows();
+    const all = seedRows().map((r) => ({ ...r, cik: normCik(r.cik) }));
     const total = all.length;
 
     const slice = wrap
@@ -521,12 +528,15 @@ export default async function handler(req, res) {
       .slice(0, scanCap);
 
     for (let i = 0; i < recentEntries.length; i++) {
-      if (out.length >= (wrap ? 100 : limit)) break; // keep bounded
+      if (out.length >= (wrap ? 100 : limit)) break;
       if (timeLeft() < 1200) break;
 
       const { linkHref, updated } = recentEntries[i];
       const meta = extractCikAndAccession(linkHref);
       if (!meta) continue;
+
+      // --- NEW: CIK for this filing ---
+      const filingCik = normCik(meta.cik);
 
       try {
         await sleep(Math.min(betweenCallsMs, Math.max(0, timeLeft() - 1000)));
@@ -565,6 +575,7 @@ export default async function handler(req, res) {
             xmlUrl,
             xmlName,
             purchasesFound: purchases.length,
+            filingCik,
             ...(dbg || {}),
           });
         }
@@ -577,6 +588,7 @@ export default async function handler(req, res) {
 
           out.push({
             id,
+            cik: filingCik, // ✅ THIS IS THE KEY FIX
             insiderName: nm,
             insiderTitle: pch.officerTitle || "—",
             employerTicker: sym,
@@ -601,11 +613,12 @@ export default async function handler(req, res) {
     if (out.length >= (wrap ? 100 : limit)) break;
   }
 
-  // If live found nothing, fallback to seed (keeps UI alive)
   const liveReturned = out.length;
-  const allRows = liveReturned ? out : seedRows();
+  const allRows = (liveReturned ? out : seedRows()).map((r) => ({
+    ...r,
+    cik: normCik(r.cik),
+  }));
 
-  // Final response shape
   let payload;
   if (wrap) {
     const total = allRows.length;
