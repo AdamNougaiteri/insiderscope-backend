@@ -10,18 +10,7 @@ const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 const safeText = (v) => (v === null || v === undefined ? "" : String(v).trim());
 const isoDateOnly = (s) => (s ? String(s).slice(0, 10) : null);
 
-// --- NEW: normalize/pad CIK ---
-function normCik(cik) {
-  const s = safeText(cik).replace(/\D/g, "");
-  if (!s) return null;
-  return s.padStart(10, "0");
-}
-
-globalThis.__INSIDER_CACHE__ = globalThis.__INSIDER_CACHE__ || {
-  ts: 0,
-  key: "",
-  data: null,
-};
+globalThis.__INSIDER_CACHE__ = globalThis.__INSIDER_CACHE__ || { ts: 0, key: "", data: null };
 const memCache = globalThis.__INSIDER_CACHE__;
 
 function stripNamespaces(xml) {
@@ -59,18 +48,13 @@ function extractCikAndAccession(url) {
   const cik = m[1];
   const acc = m[2];
 
-  const accessionNoDashed = acc.includes("-")
-    ? acc
-    : `${acc.slice(0, 10)}-${acc.slice(10, 12)}-${acc.slice(12)}`;
-
+  const accessionNoDashed = acc.includes("-") ? acc : `${acc.slice(0, 10)}-${acc.slice(10, 12)}-${acc.slice(12)}`;
   const accessionNoNoDash = accessionNoDashed.replace(/-/g, "");
   return { cik, accessionNoDashed, accessionNoNoDash };
 }
 
 function indexJsonUrl(cik, accessionNoNoDash) {
-  return `https://www.sec.gov/Archives/edgar/data/${Number(
-    cik
-  )}/${accessionNoNoDash}/index.json`;
+  return `https://www.sec.gov/Archives/edgar/data/${Number(cik)}/${accessionNoNoDash}/index.json`;
 }
 
 function pickForm4Xml(indexJson) {
@@ -92,10 +76,7 @@ function pickForm4Xml(indexJson) {
 }
 
 function parseAtom(xml) {
-  const parser = new XMLParser({
-    ignoreAttributes: false,
-    attributeNamePrefix: "",
-  });
+  const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "" });
   const doc = parser.parse(xml);
   const feed = doc?.feed;
   let entries = feed?.entry || [];
@@ -115,18 +96,14 @@ function valueField(node) {
   return node;
 }
 
-function parseForm4Purchases(xmlTextRaw, debugCapture = null) {
+function parseForm4Purchases(xmlTextRaw) {
   const xmlText = stripNamespaces(xmlTextRaw);
-  const parser = new XMLParser({
-    ignoreAttributes: false,
-    attributeNamePrefix: "",
-  });
+  const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "" });
 
   let doc;
   try {
     doc = parser.parse(xmlText);
-  } catch (e) {
-    if (debugCapture) debugCapture.parseError = String(e);
+  } catch {
     return [];
   }
 
@@ -138,8 +115,7 @@ function parseForm4Purchases(xmlTextRaw, debugCapture = null) {
     safeText(root?.issuer?.tradingSymbol) ||
     "";
 
-  const issuerName =
-    safeText(root?.issuer?.issuerName) || safeText(root?.issuerName) || "";
+  const issuerName = safeText(root?.issuer?.issuerName) || safeText(root?.issuerName) || "";
 
   const ownerName =
     safeText(root?.reportingOwner?.reportingOwnerId?.rptOwnerName) ||
@@ -164,48 +140,20 @@ function parseForm4Purchases(xmlTextRaw, debugCapture = null) {
     for (const h of hits) txs.push(...ensureArray(h));
   }
 
-  if (debugCapture) {
-    const codes = {};
-    for (const t of txs) {
-      const code = safeText(
-        valueField(t?.transactionCoding?.transactionCode) ??
-          t?.transactionCode ??
-          ""
-      );
-      if (code) codes[code] = (codes[code] || 0) + 1;
-    }
-    debugCapture.nonDerivCount = txs.length;
-    debugCapture.codes = codes;
-  }
-
   const purchases = [];
 
   for (const t of txs) {
-    const code = safeText(
-      valueField(t?.transactionCoding?.transactionCode) ??
-        t?.transactionCode ??
-        ""
-    );
+    const code = safeText(valueField(t?.transactionCoding?.transactionCode) ?? t?.transactionCode ?? "");
     if (code !== "P") continue;
 
-    const shares = numVal(
-      valueField(t?.transactionAmounts?.transactionShares) ??
-        valueField(t?.transactionShares) ??
-        null
-    );
-
+    const shares = numVal(valueField(t?.transactionAmounts?.transactionShares) ?? valueField(t?.transactionShares) ?? null);
     const price = numVal(
       valueField(t?.transactionAmounts?.transactionPricePerShare) ??
         valueField(t?.transactionPricePerShare) ??
         null
     );
 
-    const date =
-      isoDateOnly(
-        valueField(t?.transactionDate) ??
-          valueField(t?.transactionDate?.value) ??
-          null
-      ) || null;
+    const date = isoDateOnly(valueField(t?.transactionDate) ?? valueField(t?.transactionDate?.value) ?? null) || null;
 
     if (!Number.isFinite(shares) || !Number.isFinite(price)) continue;
 
@@ -232,7 +180,7 @@ async function fetchAtomPage({ start, headers }) {
   return { resp, url };
 }
 
-// Seed rows — now includes CIK
+// Seed rows now include cik + stable id
 function seedRows() {
   const today = new Date();
   const daysAgo = (n) => {
@@ -242,10 +190,11 @@ function seedRows() {
   };
 
   return [
-    // MSFT CIK: 0000789019
     {
-      id: "nadella-msft-2025-12-21",
+      id: "0000789019-000000000000000000-0",
       cik: "0000789019",
+      accessionNo: "0000000000-00-000000",
+      sourceUrl: "",
       insiderName: "Satya Nadella",
       insiderTitle: "CEO",
       employerTicker: "MSFT",
@@ -256,12 +205,15 @@ function seedRows() {
       pricePerShare: 412.15,
       totalValue: 10303750,
       transactionDate: daysAgo(5),
+      filingDate: daysAgo(5),
       signalScore: 88,
       purchaseType: "own-company",
     },
     {
-      id: "hood-msft-2025-12-20",
+      id: "0000789019-000000000000000000-1",
       cik: "0000789019",
+      accessionNo: "0000000000-00-000000",
+      sourceUrl: "",
       insiderName: "Amy Hood",
       insiderTitle: "CFO",
       employerTicker: "MSFT",
@@ -272,139 +224,11 @@ function seedRows() {
       pricePerShare: 408.0,
       totalValue: 3264000,
       transactionDate: daysAgo(6),
+      filingDate: daysAgo(6),
       signalScore: 82,
       purchaseType: "own-company",
     },
-
-    // AAPL CIK: 0000320193 (this row is “external NKE” but keep cik as employer company)
-    {
-      id: "cook-nke-2025-12-22",
-      cik: "0000320193",
-      insiderName: "Timothy D. Cook",
-      insiderTitle: "CEO",
-      employerTicker: "AAPL",
-      employerCompany: "Apple Inc.",
-      purchasedTicker: "NKE",
-      purchasedCompany: "Nike Inc.",
-      shares: 50000,
-      pricePerShare: 103.25,
-      totalValue: 5162500,
-      transactionDate: daysAgo(4),
-      signalScore: 92,
-      purchaseType: "external",
-    },
-
-    // Demo rows (fake CIKs but non-null)
-    {
-      id: "demo-2",
-      cik: "0000000001",
-      insiderName: "John Smith",
-      insiderTitle: "Director",
-      employerTicker: "ACME",
-      employerCompany: "Acme Corp.",
-      purchasedTicker: "ACME",
-      purchasedCompany: "Acme Corp.",
-      shares: 8000,
-      pricePerShare: 55.1,
-      totalValue: 440800,
-      transactionDate: daysAgo(9),
-      signalScore: 67,
-      purchaseType: "own-company",
-    },
-    {
-      id: "demo-3",
-      cik: "0000000002",
-      insiderName: "Alex Kim",
-      insiderTitle: "CEO",
-      employerTicker: "RIVR",
-      employerCompany: "River Tech",
-      purchasedTicker: "RIVR",
-      purchasedCompany: "River Tech",
-      shares: 20000,
-      pricePerShare: 14.75,
-      totalValue: 295000,
-      transactionDate: daysAgo(12),
-      signalScore: 59,
-      purchaseType: "own-company",
-    },
   ];
-}
-
-// Groups (“Company Clusters”) computed from returned rows
-function computeGroups(rows) {
-  const eligible = rows.filter((r) => {
-    const type = safeText(r.purchaseType).toLowerCase();
-    const price = Number(r.pricePerShare ?? 0);
-    const shares = Number(r.shares ?? 0);
-    if (type.includes("option") || type.includes("exercise")) return false;
-    if (!(price > 0) || !(shares > 0)) return false;
-    return true;
-  });
-
-  const byTicker = new Map();
-
-  for (const r of eligible) {
-    const t = safeText(r.purchasedTicker || r.employerTicker);
-    if (!t) continue;
-
-    const key = t.toUpperCase();
-    if (!byTicker.has(key)) {
-      byTicker.set(key, {
-        ticker: key,
-        company: safeText(r.purchasedCompany || r.employerCompany || ""),
-        insiders: [],
-        insiderSet: new Set(),
-        totalValue: 0,
-        latestDate: "",
-      });
-    }
-
-    const g = byTicker.get(key);
-    const name = safeText(r.insiderName);
-    if (name && !g.insiderSet.has(name)) {
-      g.insiderSet.add(name);
-    }
-
-    g.insiders.push({
-      insiderName: name || "—",
-      insiderTitle: safeText(r.insiderTitle) || "—",
-      value: Number(r.totalValue ?? 0),
-      date: safeText(r.transactionDate) || "",
-      purchaseType: safeText(r.purchaseType) || "",
-    });
-
-    g.totalValue += Number(r.totalValue ?? 0);
-
-    const dt = safeText(r.transactionDate);
-    if (dt && (!g.latestDate || dt > g.latestDate)) g.latestDate = dt;
-  }
-
-  const groups = [];
-  for (const [, g] of byTicker) {
-    const insiderCount = g.insiderSet.size;
-    if (insiderCount < 2) continue;
-
-    const insidersSorted = g.insiders
-      .slice()
-      .sort((a, b) => (b.value || 0) - (a.value || 0))
-      .slice(0, 6);
-
-    groups.push({
-      ticker: g.ticker,
-      company: g.company || "—",
-      insiderCount,
-      totalValue: Math.round(g.totalValue),
-      latestDate: g.latestDate || "",
-      insiders: insidersSorted,
-    });
-  }
-
-  groups.sort((a, b) => {
-    if (b.insiderCount !== a.insiderCount) return b.insiderCount - a.insiderCount;
-    return (b.totalValue || 0) - (a.totalValue || 0);
-  });
-
-  return groups;
 }
 
 export default async function handler(req, res) {
@@ -419,15 +243,13 @@ export default async function handler(req, res) {
     });
   }
 
-  const debug = String(req.query.debug || "") === "1";
   const wrap = String(req.query.wrap || "") === "1";
   const includeGroups = String(req.query.includeGroups || "") === "1";
-  const mode = safeText(req.query.mode || ""); // "seed" to force demo
-  const v = safeText(req.query.v || ""); // cache buster
+  const mode = safeText(req.query.mode || ""); // "seed"
+  const v = safeText(req.query.v || "");
 
   const pageSize = clamp(toInt(req.query.pageSize, 50), 1, 100);
   const page = clamp(toInt(req.query.page, 1), 1, 1000);
-
   const limit = clamp(toInt(req.query.limit, pageSize), 1, 100);
   const days = clamp(toInt(req.query.days, 30), 1, 365);
 
@@ -447,34 +269,20 @@ export default async function handler(req, res) {
     return res.status(200).json(memCache.data);
   }
 
-  // Seed mode
   if (mode === "seed") {
-    const all = seedRows().map((r) => ({ ...r, cik: normCik(r.cik) }));
+    const all = seedRows();
     const total = all.length;
-
     const slice = wrap
       ? all.slice((page - 1) * pageSize, (page - 1) * pageSize + pageSize)
       : all.slice(0, limit);
 
     const payload = wrap
-      ? {
-          data: slice,
-          meta: {
-            total,
-            page,
-            pageSize,
-            offset: (page - 1) * pageSize,
-            mode: "seed",
-            source: "seed",
-          },
-          ...(includeGroups ? { groups: computeGroups(all) } : {}),
-        }
+      ? { data: slice, meta: { total, page, pageSize, offset: (page - 1) * pageSize, mode: "seed", source: "seed" } }
       : slice;
 
     memCache.ts = Date.now();
     memCache.key = cacheKey;
     memCache.data = payload;
-
     return res.status(200).json(payload);
   }
 
@@ -485,37 +293,25 @@ export default async function handler(req, res) {
   };
 
   const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
-
   const out = [];
-  const errorsSample = [];
-  const samples = [];
-  let entriesSeenTotal = 0;
 
   for (let p = 0; p < pages; p++) {
     if (timeLeft() < 1200) break;
 
     const start = p * 100;
-    let atomXml;
-    let atomUrl;
 
+    let atomXml;
     try {
       if (p > 0) await sleep(Math.min(betweenCallsMs, Math.max(0, timeLeft() - 1000)));
-      const { resp, url } = await fetchAtomPage({ start, headers });
-      atomUrl = url;
-
+      const { resp } = await fetchAtomPage({ start, headers });
       if (resp.status === 429) break;
-      if (!resp.ok) {
-        errorsSample.push({ where: "atom", status: resp.status, atomUrl });
-        continue;
-      }
+      if (!resp.ok) continue;
       atomXml = await resp.text();
-    } catch (e) {
-      errorsSample.push({ where: "atom", error: String(e), atomUrl });
+    } catch {
       continue;
     }
 
     const entries = parseAtom(atomXml);
-    entriesSeenTotal += entries.length;
 
     const recentEntries = entries
       .map((en) => {
@@ -535,66 +331,45 @@ export default async function handler(req, res) {
       const meta = extractCikAndAccession(linkHref);
       if (!meta) continue;
 
-      // --- NEW: CIK for this filing ---
-      const filingCik = normCik(meta.cik);
-
       try {
         await sleep(Math.min(betweenCallsMs, Math.max(0, timeLeft() - 1000)));
 
         const idxUrl = indexJsonUrl(meta.cik, meta.accessionNoNoDash);
         const idxResp = await fetch(idxUrl, { headers });
-        if (!idxResp.ok) {
-          errorsSample.push({ where: "index.json", status: idxResp.status, idxUrl });
-          continue;
-        }
+        if (!idxResp.ok) continue;
 
         const idxJson = await idxResp.json();
         const xmlName = pickForm4Xml(idxJson);
         if (!xmlName) continue;
 
-        const xmlUrl = `https://www.sec.gov/Archives/edgar/data/${Number(
-          meta.cik
-        )}/${meta.accessionNoNoDash}/${xmlName}`;
+        const xmlUrl = `https://www.sec.gov/Archives/edgar/data/${Number(meta.cik)}/${meta.accessionNoNoDash}/${xmlName}`;
 
         await sleep(Math.min(betweenCallsMs, Math.max(0, timeLeft() - 1000)));
 
         const xmlResp = await fetch(xmlUrl, { headers });
-        if (!xmlResp.ok) {
-          errorsSample.push({ where: "form4.xml", status: xmlResp.status, xmlUrl });
-          continue;
-        }
+        if (!xmlResp.ok) continue;
 
         const xmlText = await xmlResp.text();
+        const purchases = parseForm4Purchases(xmlText);
 
-        const dbg = debug ? {} : null;
-        const purchases = parseForm4Purchases(xmlText, dbg);
+        const filingDate = isoDateOnly(updated);
 
-        if (debug && samples.length < 15) {
-          samples.push({
-            idxUrl,
-            xmlUrl,
-            xmlName,
-            purchasesFound: purchases.length,
-            filingCik,
-            ...(dbg || {}),
-          });
-        }
-
-        for (const pch of purchases) {
-          const dt = pch.transactionDate || isoDateOnly(updated);
-          const sym = pch.issuerTradingSymbol || "—";
-          const nm = pch.ownerName || "—";
-          const id = `${nm}-${sym}-${dt}-${Math.random().toString(16).slice(2)}`;
+        purchases.forEach((pch, idx) => {
+          const dt = pch.transactionDate || filingDate;
+          const stableId = `${meta.accessionNoNoDash}-${idx}`;
 
           out.push({
-            id,
-            cik: filingCik, // ✅ THIS IS THE KEY FIX
-            insiderName: nm,
+            id: stableId,                 // <- this is what ingest will use as transaction_id
+            cik: meta.cik,                // <- fixes your NOT NULL cik issue
+            accessionNo: meta.accessionNoDashed,
+            sourceUrl: xmlUrl,
+            filingDate,
+            insiderName: pch.ownerName || "—",
             insiderTitle: pch.officerTitle || "—",
-            employerTicker: sym,
-            employerCompany: pch.issuerName || "—",
-            purchasedTicker: sym,
-            purchasedCompany: pch.issuerName || "—",
+            employerTicker: pch.issuerTradingSymbol || "",
+            employerCompany: pch.issuerName || "",
+            purchasedTicker: pch.issuerTradingSymbol || "",
+            purchasedCompany: pch.issuerName || "",
             shares: pch.shares,
             pricePerShare: pch.pricePerShare,
             totalValue: pch.totalValue,
@@ -602,28 +377,25 @@ export default async function handler(req, res) {
             signalScore: 50,
             purchaseType: "own-company",
           });
+        });
 
-          if (out.length >= (wrap ? 100 : limit)) break;
-        }
-      } catch (e) {
-        errorsSample.push({ where: "loop", error: String(e) });
+        if (out.length >= (wrap ? 100 : limit)) break;
+      } catch {
+        continue;
       }
     }
 
     if (out.length >= (wrap ? 100 : limit)) break;
   }
 
+  // If SEC live yields nothing, fallback to seed
   const liveReturned = out.length;
-  const allRows = (liveReturned ? out : seedRows()).map((r) => ({
-    ...r,
-    cik: normCik(r.cik),
-  }));
+  const allRows = liveReturned ? out : seedRows();
 
   let payload;
   if (wrap) {
     const total = allRows.length;
     const slice = allRows.slice((page - 1) * pageSize, (page - 1) * pageSize + pageSize);
-
     payload = {
       data: slice,
       meta: {
@@ -634,25 +406,6 @@ export default async function handler(req, res) {
         mode: "live",
         source: liveReturned ? "sec-live" : "fallback-seed",
       },
-      ...(includeGroups ? { groups: computeGroups(allRows) } : {}),
-      ...(debug
-        ? {
-            debug: {
-              cache: liveReturned ? "miss-fill" : "fallback-seed",
-              returnedLive: liveReturned,
-              totalServed: allRows.length,
-              entriesSeen: entriesSeenTotal,
-              cutoff: new Date(cutoff).toISOString(),
-              scanCap,
-              pages,
-              throttle: betweenCallsMs,
-              budget: TIME_BUDGET_MS,
-              timeSpentMs: Date.now() - startedAt,
-              errorsSample,
-              samples,
-            },
-          }
-        : {}),
     };
   } else {
     payload = allRows.slice(0, limit);
