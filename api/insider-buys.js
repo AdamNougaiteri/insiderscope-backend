@@ -6,16 +6,9 @@ const BASE_ATOM =
 const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const REQUEST_DELAY_MS = 350;
 
-let cache = {
-  ts: 0,
-  key: "",
-  data: [],
-  debug: {},
-};
+let cache = { ts: 0, key: "", data: [], debug: {} };
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 function clampInt(v, def, min, max) {
   const n = Number(v);
   if (!Number.isFinite(n)) return def;
@@ -38,16 +31,11 @@ function extractTag(xml, tag) {
   const m = xml.match(re);
   return m ? m[1].trim() : null;
 }
-
-// IMPORTANT: Form 4 often nests values like <transactionCode><value>P</value></transactionCode>
 function extractTagValue(xml, tag) {
   const inner = extractTag(xml, tag);
   if (!inner) return null;
-
   const v = extractTag(inner, "value");
   if (v) return v.trim();
-
-  // fallback: strip any XML tags
   return inner.replace(/<[^>]+>/g, "").trim() || null;
 }
 
@@ -104,8 +92,7 @@ function parseTransactionsFromForm4Xml(form4Xml) {
   let m;
   while ((m = re.exec(form4Xml))) {
     const block = m[1];
-
-    const code = extractTagValue(block, "transactionCode"); // <-- FIX
+    const code = extractTagValue(block, "transactionCode");
     if (String(code || "").toUpperCase() !== "P") continue;
 
     const sharesStr = extractTagValue(block, "transactionShares");
@@ -149,17 +136,18 @@ export default async function handler(req, res) {
 
   const limit = clampInt(req.query.limit, 25, 1, 200);
   const days = clampInt(req.query.days, 30, 1, 180);
+
+  // NEW: cap how many filings we scan per request so it can't hang/time out
+  // (you can raise this later once caching is in and stable)
+  const scan = clampInt(req.query.scan, 25, 5, 100);
+
   const debug = String(req.query.debug || "") === "1";
 
-  const cacheKey = `${limit}:${days}`;
+  const cacheKey = `${limit}:${days}:${scan}`;
   const now = Date.now();
 
   if (cache.key === cacheKey && now - cache.ts < CACHE_TTL_MS) {
-    if (debug)
-      return res.status(200).json({
-        data: cache.data,
-        debug: { ...cache.debug, cache: "hit-fresh" },
-      });
+    if (debug) return res.status(200).json({ data: cache.data, debug: { ...cache.debug, cache: "hit-fresh" } });
     return res.status(200).json(cache.data);
   }
 
@@ -179,19 +167,14 @@ export default async function handler(req, res) {
         if (debug) {
           return res.status(200).json({
             data: cache.data,
-            debug: {
-              cache: "hit-stale",
-              reason: `SEC Atom fetch failed (${atom.status})`,
-              lastCacheAgeSec: Math.round((now - cache.ts) / 1000),
-            },
+            debug: { cache: "hit-stale", reason: `SEC Atom fetch failed (${atom.status})` },
           });
         }
         return res.status(200).json(cache.data);
       }
-
       return res.status(atom.status).json({
         error: `SEC Atom fetch failed (${atom.status})`,
-        hint: "SEC rate limited you. Wait a few minutes and retry.",
+        hint: "SEC rate limited you. Try again later.",
       });
     }
 
@@ -199,8 +182,11 @@ export default async function handler(req, res) {
     const out = [];
     const errors = [];
 
+    let filingsScanned = 0;
+
     for (const entryXml of entries) {
       if (out.length >= limit) break;
+      if (filingsScanned >= scan) break;
 
       const updated = extractTag(entryXml, "updated") || extractTag(entryXml, "published");
       if (updated && new Date(updated).toISOString() < cutoffIso) continue;
@@ -208,6 +194,8 @@ export default async function handler(req, res) {
       const hrefs = extractLinksFromEntry(entryXml);
       const indexUrl = pickFilingIndexHtmlLink(hrefs);
       if (!indexUrl) continue;
+
+      filingsScanned++;
 
       try {
         const indexHtml = await fetchFilingIndexHtml(indexUrl, headers);
@@ -218,12 +206,11 @@ export default async function handler(req, res) {
         const issuerTradingSymbol =
           extractTagValue(form4Xml, "issuerTradingSymbol") || extractTag(form4Xml, "issuerTradingSymbol");
 
-        const reportingOwnerName = extractTagValue(form4Xml, "rptOwnerName") || extractTag(form4Xml, "rptOwnerName");
-        const officerTitle =
-          extractTagValue(form4Xml, "officerTitle") || extractTag(form4Xml, "officerTitle");
+        const reportingOwnerName =
+          extractTagValue(form4Xml, "rptOwnerName") || extractTag(form4Xml, "rptOwnerName");
+        const officerTitle = extractTagValue(form4Xml, "officerTitle") || extractTag(form4Xml, "officerTitle");
 
         const role = officerTitle || null;
-
         const txs = parseTransactionsFromForm4Xml(form4Xml);
 
         for (const t of txs) {
@@ -235,9 +222,7 @@ export default async function handler(req, res) {
               : null;
 
           out.push({
-            id: `${(reportingOwnerName || "insider").toLowerCase().replace(/\s+/g, "-")}-${
-              issuerTradingSymbol || "na"
-            }-${t.transactionDate || "na"}`,
+            id: `${(reportingOwnerName || "insider").toLowerCase().replace(/\s+/g, "-")}-${issuerTradingSymbol || "na"}-${t.transactionDate || "na"}`,
             insiderName: reportingOwnerName || null,
             insiderTitle: role,
             employerTicker: issuerTradingSymbol || null,
@@ -254,76 +239,28 @@ export default async function handler(req, res) {
         }
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        if (msg.includes(" 429") || msg.includes(" 403")) {
-          errors.push({ indexUrl, message: msg });
-          break;
-        }
         errors.push({ indexUrl, message: msg });
       }
     }
 
-    if (out.length) {
-      cache = {
-        ts: now,
-        key: cacheKey,
-        data: out,
-        debug: {
-          cache: "miss-refresh",
-          returned: out.length,
-          entriesSeen: entries.length,
-          cutoff: cutoffIso,
-          errorsSample: errors.slice(0, 10),
-        },
-      };
+    cache = {
+      ts: now,
+      key: cacheKey,
+      data: out,
+      debug: {
+        cache: "miss-refresh",
+        returned: out.length,
+        entriesSeen: entries.length,
+        filingsScanned,
+        scanCap: scan,
+        cutoff: cutoffIso,
+        errorsSample: errors.slice(0, 10),
+      },
+    };
 
-      if (debug) return res.status(200).json({ data: out, debug: cache.debug });
-      return res.status(200).json(out);
-    }
-
-    if (cache.data?.length) {
-      if (debug) {
-        return res.status(200).json({
-          data: cache.data,
-          debug: {
-            cache: "hit-stale-empty-refresh",
-            returned: cache.data.length,
-            lastCacheAgeSec: Math.round((now - cache.ts) / 1000),
-            errorsSample: errors.slice(0, 10),
-          },
-        });
-      }
-      return res.status(200).json(cache.data);
-    }
-
-    if (debug) {
-      return res.status(200).json({
-        data: [],
-        debug: {
-          cache: "miss-empty",
-          returned: 0,
-          entriesSeen: entries.length,
-          cutoff: cutoffIso,
-          errorsSample: errors.slice(0, 10),
-        },
-      });
-    }
-
-    return res.status(200).json([]);
+    if (debug) return res.status(200).json({ data: out, debug: cache.debug });
+    return res.status(200).json(out);
   } catch (e) {
-    if (cache.data?.length) {
-      if (debug) {
-        return res.status(200).json({
-          data: cache.data,
-          debug: {
-            cache: "hit-stale-exception",
-            error: e instanceof Error ? e.message : String(e),
-            lastCacheAgeSec: Math.round((now - cache.ts) / 1000),
-          },
-        });
-      }
-      return res.status(200).json(cache.data);
-    }
-
     return res.status(500).json({ error: e instanceof Error ? e.message : "Unknown error" });
   }
 }
