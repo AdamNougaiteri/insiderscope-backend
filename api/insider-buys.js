@@ -1,30 +1,82 @@
 // /api/insider-buys.js
-// Cached + throttled SEC Atom fetcher for insider buys (Form 4).
-// Works on Vercel Serverless. Uses in-memory cache (best-effort) + Vercel edge caching.
-
 import { XMLParser } from "fast-xml-parser";
 
-// --- tiny utils ---
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-function toInt(v, d) {
+const toInt = (v, d) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : d;
+};
+const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
+const safeText = (v) => (v === null || v === undefined ? "" : String(v).trim());
+const isoDateOnly = (s) => (s ? String(s).slice(0, 10) : null);
+
+// Best-effort warm cache
+globalThis.__INSIDER_CACHE__ = globalThis.__INSIDER_CACHE__ || {
+  ts: 0,
+  key: "",
+  data: null,
+};
+const memCache = globalThis.__INSIDER_CACHE__;
+
+// Prefer the Atom link that contains /Archives/
+function pickArchivesLink(entry) {
+  const links = entry?.link;
+  if (!links) return "";
+  const arr = Array.isArray(links) ? links : [links];
+  const hrefs = arr.map((l) => safeText(l?.href)).filter(Boolean);
+  return (
+    hrefs.find((h) => h.includes("/Archives/")) ||
+    hrefs[0] ||
+    ""
+  );
 }
 
-function clamp(n, min, max) {
-  return Math.max(min, Math.min(max, n));
+// Extract cik + accession from archive URL (handles dashed or nodash accession)
+function extractCikAndAccession(url) {
+  const u = safeText(url);
+
+  // matches:
+  // /edgar/data/1935209/000119312525331321/
+  // /edgar/data/1935209/0001193125-25-331321/
+  const m = u.match(
+    /edgar\/data\/(\d+)\/(\d{18}|\d{10}-\d{2}-\d{6})/i
+  );
+  if (!m) return null;
+
+  const cik = m[1];
+  const acc = m[2];
+
+  const accessionNoDashed = acc.includes("-")
+    ? acc
+    : `${acc.slice(0, 10)}-${acc.slice(10, 12)}-${acc.slice(12)}`;
+
+  const accessionNoNoDash = accessionNoDashed.replace(/-/g, "");
+
+  return { cik, accessionNoDashed, accessionNoNoDash };
 }
 
-function isoDateOnly(s) {
-  if (!s) return null;
-  // Handles "2025-12-22T..." or "2025-12-22"
-  return String(s).slice(0, 10);
+// IMPORTANT: use www.sec.gov/Archives for archive files
+function indexJsonUrl(cik, accessionNoNoDash) {
+  return `https://www.sec.gov/Archives/edgar/data/${Number(
+    cik
+  )}/${accessionNoNoDash}/index.json`;
 }
 
-function safeText(v) {
-  if (v === null || v === undefined) return "";
-  return String(v).trim();
+function pickForm4Xml(indexJson) {
+  const files = indexJson?.directory?.item || [];
+  const arr = Array.isArray(files) ? files : [files].filter(Boolean);
+
+  const xmls = arr
+    .map((f) => safeText(f?.name))
+    .filter(Boolean)
+    .filter((n) => n.toLowerCase().endsWith(".xml"));
+
+  return (
+    xmls.find((n) => n.toLowerCase().includes("form4")) ||
+    xmls.find((n) => n.toLowerCase().includes("primary")) ||
+    xmls[0] ||
+    null
+  );
 }
 
 function parseAtom(xml) {
@@ -39,71 +91,17 @@ function parseAtom(xml) {
   return entries;
 }
 
-// Extract accession number + CIK from an SEC archive URL
-// Example: https://www.sec.gov/Archives/edgar/data/320193/000032019325000123/...
-function extractCikAndAccession(url) {
-  const u = safeText(url);
-  const m = u.match(/edgar\/data\/(\d+)\/(\d{18,})/i);
-  if (!m) return null;
-  const cik = m[1];
-  const accessionNoRaw = m[2];
-  // Convert 000032019325000123 -> 0000320193-25-000123 (SEC format)
-  const accessionNo =
-    accessionNoRaw.length === 18
-      ? `${accessionNoRaw.slice(0, 10)}-${accessionNoRaw.slice(
-          10,
-          12
-        )}-${accessionNoRaw.slice(12)}`
-      : accessionNoRaw;
-  return { cik, accessionNo };
-}
-
-// Build SEC "index.json" URL for filing directory
-function indexJsonUrl(cik, accessionNoRawOrDashed) {
-  const dashed = accessionNoRawOrDashed.includes("-")
-    ? accessionNoRawOrDashed
-    : accessionNoRawOrDashed;
-  const nodash = dashed.replace(/-/g, "");
-  return `https://data.sec.gov/Archives/edgar/data/${Number(
-    cik
-  )}/${nodash}/index.json`;
-}
-
-// Find likely Form 4 XML file inside index.json listing
-function pickForm4Xml(indexJson) {
-  const files = indexJson?.directory?.item || [];
-  const arr = Array.isArray(files) ? files : [files].filter(Boolean);
-
-  // Prefer something that looks like "form4.xml" or contains "primary_doc.xml"
-  const candidates = arr
-    .map((f) => safeText(f?.name))
-    .filter(Boolean)
-    .filter((name) => name.toLowerCase().endsWith(".xml"));
-
-  const preferred =
-    candidates.find((n) => n.toLowerCase().includes("form4")) ||
-    candidates.find((n) => n.toLowerCase().includes("primary")) ||
-    candidates[0];
-
-  return preferred || null;
-}
-
-// Minimal parse: pull issuer, reporting owner, and NON-derivative purchases ("P")
+// Minimal Form 4 parser: purchases ("P") in non-derivatives
 function parseForm4Xml(xmlText) {
   const parser = new XMLParser({
     ignoreAttributes: false,
     attributeNamePrefix: "",
   });
   const doc = parser.parse(xmlText);
-
-  // XML shapes vary; be defensive.
-  const ownershipDocument =
-    doc?.ownershipDocument || doc?.document || doc || {};
+  const ownershipDocument = doc?.ownershipDocument || doc?.document || doc || {};
 
   const issuer = ownershipDocument?.issuer || {};
   const reportingOwner = ownershipDocument?.reportingOwner || {};
-
-  // reportingOwner can be array
   const ro = Array.isArray(reportingOwner)
     ? reportingOwner[0]
     : reportingOwner || {};
@@ -120,14 +118,10 @@ function parseForm4Xml(xmlText) {
       ro?.reportingOwnerRelationship?.otherText
   );
 
-  const nonDerivTable =
+  const table =
     ownershipDocument?.nonDerivativeTable?.nonDerivativeTransaction || [];
+  const txs = Array.isArray(table) ? table : [table].filter(Boolean);
 
-  const txs = Array.isArray(nonDerivTable)
-    ? nonDerivTable
-    : [nonDerivTable].filter(Boolean);
-
-  // Keep only purchases ("P")
   const purchases = txs
     .map((t) => {
       const code = safeText(
@@ -147,9 +141,7 @@ function parseForm4Xml(xmlText) {
           t?.transactionPricePerShare ??
           0
       );
-      const date = safeText(
-        t?.transactionDate?.value ?? t?.transactionDate ?? ""
-      );
+      const date = safeText(t?.transactionDate?.value ?? t?.transactionDate ?? "");
 
       if (!Number.isFinite(shares) || !Number.isFinite(price)) return null;
 
@@ -169,40 +161,28 @@ function parseForm4Xml(xmlText) {
   return purchases;
 }
 
-// --- BEST-EFFORT in-memory cache across warm invocations ---
-globalThis.__INSIDER_CACHE__ = globalThis.__INSIDER_CACHE__ || {
-  ts: 0,
-  key: "",
-  data: null,
-};
-const memCache = globalThis.__INSIDER_CACHE__;
-
-// Main handler
 export default async function handler(req, res) {
-  // Edge cache headers (lets Vercel cache responses)
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.setHeader("Cache-Control", "s-maxage=300, stale-while-revalidate=3600");
 
-  const SEC_UA = process.env.SEC_USER_AGENT; // you already set this
+  const SEC_UA = process.env.SEC_USER_AGENT;
   if (!SEC_UA) {
     return res.status(500).json({
       error: "Missing SEC_USER_AGENT env var",
-      hint: 'Set SEC_USER_AGENT like: "YourAppName (youremail+insiderscope@gmail.com)"',
+      hint:
+        'Set SEC_USER_AGENT like: "InsiderScope (your_email@example.com)"',
     });
   }
 
   const limit = clamp(toInt(req.query.limit, 25), 1, 200);
   const days = clamp(toInt(req.query.days, 30), 1, 365);
-  const debug = String(req.query.debug || "") === "1";
-
-  // scan = how many Atom entries we will attempt to fully parse (each may trigger extra SEC calls)
   const scanCap = clamp(toInt(req.query.scan, 15), 1, 50);
+  const debug = String(req.query.debug || "") === "1";
 
   const cacheKey = `limit=${limit}|days=${days}|scan=${scanCap}`;
   const now = Date.now();
-  const cacheTtlMs = 5 * 60 * 1000; // 5 min
+  const cacheTtlMs = 5 * 60 * 1000;
 
-  // Serve in-memory cache if fresh
   if (
     memCache.data &&
     memCache.key === cacheKey &&
@@ -215,9 +195,8 @@ export default async function handler(req, res) {
     );
   }
 
-  // Atom feed: "Insider Transactions (Form 4)"
-  // NOTE: SEC sometimes changes feeds; this one is commonly used.
-  const atomUrl = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&count=100&output=atom";
+  const atomUrl =
+    "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&count=100&output=atom";
 
   const headers = {
     "User-Agent": SEC_UA,
@@ -229,7 +208,6 @@ export default async function handler(req, res) {
   try {
     const atomResp = await fetch(atomUrl, { headers });
     if (atomResp.status === 429) {
-      // If we have any cached data (even stale), return it instead of failing hard
       if (memCache.data) {
         return res.status(200).json(
           debug
@@ -242,7 +220,7 @@ export default async function handler(req, res) {
       }
       return res.status(429).json({
         error: "SEC Atom fetch failed (429)",
-        hint: "SEC rate limited the backend. Add caching/throttling (this file does), then redeploy and avoid rapid refreshes.",
+        hint: "SEC rate limited the backend. Reduce refreshes; caching should prevent repeated scrapes.",
       });
     }
     if (!atomResp.ok) {
@@ -256,16 +234,11 @@ export default async function handler(req, res) {
   }
 
   const entries = parseAtom(atomXml);
-
-  // Filter by days cutoff using Atom "updated"/"published"
   const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
 
   const recentEntries = entries
     .map((en) => {
-      const linkHref =
-        en?.link?.href ||
-        (Array.isArray(en?.link) ? en.link[0]?.href : null) ||
-        "";
+      const linkHref = pickArchivesLink(en);
       const updated = safeText(en?.updated || en?.published || "");
       const ts = updated ? Date.parse(updated) : 0;
       return { linkHref, updated, ts };
@@ -273,11 +246,6 @@ export default async function handler(req, res) {
     .filter((x) => x.linkHref && x.ts && x.ts >= cutoff)
     .slice(0, scanCap);
 
-  // Now for each entry:
-  // 1) get index.json
-  // 2) pick an XML
-  // 3) fetch XML
-  // 4) parse purchases
   const out = [];
   const errorsSample = [];
 
@@ -287,15 +255,14 @@ export default async function handler(req, res) {
     if (!meta) continue;
 
     try {
-      // throttle to be nice to SEC
       if (i > 0) await sleep(250);
 
-      const idxUrl = indexJsonUrl(meta.cik, meta.accessionNo);
+      const idxUrl = indexJsonUrl(meta.cik, meta.accessionNoNoDash);
       const idxResp = await fetch(idxUrl, { headers });
 
       if (idxResp.status === 429) {
         errorsSample.push({ where: "index.json", status: 429, idxUrl });
-        break; // stop to avoid a cascade of 429s
+        break;
       }
       if (!idxResp.ok) {
         errorsSample.push({ where: "index.json", status: idxResp.status, idxUrl });
@@ -306,16 +273,13 @@ export default async function handler(req, res) {
       const xmlName = pickForm4Xml(idxJson);
       if (!xmlName) continue;
 
-      const nodash = meta.accessionNo.replace(/-/g, "");
-      const xmlUrl = `https://data.sec.gov/Archives/edgar/data/${Number(
+      const xmlUrl = `https://www.sec.gov/Archives/edgar/data/${Number(
         meta.cik
-      )}/${nodash}/${xmlName}`;
+      )}/${meta.accessionNoNoDash}/${xmlName}`;
 
-      // throttle again
       await sleep(250);
 
       const xmlResp = await fetch(xmlUrl, { headers });
-
       if (xmlResp.status === 429) {
         errorsSample.push({ where: "form4.xml", status: 429, xmlUrl });
         break;
@@ -328,9 +292,10 @@ export default async function handler(req, res) {
       const xmlText = await xmlResp.text();
       const purchases = parseForm4Xml(xmlText);
 
-      // Convert to your frontend schema
       for (const p of purchases) {
-        const id = `${p.ownerName || "owner"}-${p.issuerTradingSymbol || "sym"}-${p.transactionDate || isoDateOnly(updated)}`;
+        const id = `${p.ownerName || "owner"}-${p.issuerTradingSymbol || "sym"}-${
+          p.transactionDate || isoDateOnly(updated)
+        }`;
 
         out.push({
           id,
@@ -344,7 +309,7 @@ export default async function handler(req, res) {
           pricePerShare: p.pricePerShare,
           totalValue: p.totalValue,
           transactionDate: p.transactionDate || isoDateOnly(updated),
-          signalScore: 50, // placeholder; you can compute later
+          signalScore: 50, // placeholder
           purchaseType: "own-company",
         });
 
@@ -357,7 +322,6 @@ export default async function handler(req, res) {
     }
   }
 
-  // Save to in-memory cache (even if empty, so we don’t hammer SEC on refresh)
   memCache.ts = Date.now();
   memCache.key = cacheKey;
   memCache.data = out;
