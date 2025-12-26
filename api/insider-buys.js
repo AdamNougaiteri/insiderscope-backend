@@ -2,7 +2,6 @@
 import { XMLParser } from "fast-xml-parser";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
 const toInt = (v, d) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : d;
@@ -11,17 +10,10 @@ const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 const safeText = (v) => (v === null || v === undefined ? "" : String(v).trim());
 const isoDateOnly = (s) => (s ? String(s).slice(0, 10) : null);
 
-// Robust query param getter (handles arrays and odd runtime shapes)
-function q(req, key, fallback = "") {
-  const v = req?.query?.[key];
-  if (Array.isArray(v)) return safeText(v[0] ?? fallback);
-  return safeText(v ?? fallback);
-}
-
 globalThis.__INSIDER_CACHE__ = globalThis.__INSIDER_CACHE__ || {
   ts: 0,
   key: "",
-  data: null, // stores FULL (unpaged) array
+  data: null,
 };
 const memCache = globalThis.__INSIDER_CACHE__;
 
@@ -116,8 +108,38 @@ function valueField(node) {
   return node;
 }
 
-// Only "P" transactions are actual open-market purchases.
-// This keeps your dataset clean (avoids option exercises with $0 price, etc).
+// Simple signal scoring (shared for seed + live rows)
+function calcSignalScore({ insiderTitle, totalValue, transactionDate, purchaseType }) {
+  let score = 0;
+
+  const title = String(insiderTitle || "").toLowerCase();
+  if (title.includes("ceo") || title.includes("chief executive")) score += 40;
+  else if (title.includes("cfo") || title.includes("chief financial")) score += 35;
+  else if (title.includes("director") || title.includes("chairman")) score += 25;
+  else if (title.includes("president") || title.includes("evp")) score += 20;
+  else score += 10;
+
+  const val = Number(totalValue || 0);
+  if (val > 1000000) score += 40;
+  else if (val > 500000) score += 30;
+  else if (val > 100000) score += 20;
+  else if (val > 50000) score += 10;
+  else score += 5;
+
+  const dt = new Date(transactionDate || new Date());
+  const now = new Date();
+  const diffDays = Math.ceil(Math.abs(now.getTime() - dt.getTime()) / (1000 * 60 * 60 * 24));
+  if (diffDays <= 2) score += 20;
+  else if (diffDays <= 7) score += 10;
+  else score += 5;
+
+  // Penalize option exercises a bit vs. true purchases
+  const pt = String(purchaseType || "").toLowerCase();
+  if (pt.includes("option")) score -= 10;
+
+  return Math.max(0, Math.min(100, score));
+}
+
 function parseForm4Purchases(xmlTextRaw, debugCapture = null) {
   const xmlText = stripNamespaces(xmlTextRaw);
   const parser = new XMLParser({
@@ -189,6 +211,7 @@ function parseForm4Purchases(xmlTextRaw, debugCapture = null) {
         t?.transactionCode ??
         ""
     );
+    // Keep strict: only true purchases
     if (code !== "P") continue;
 
     const shares = numVal(
@@ -235,7 +258,66 @@ async function fetchAtomPage({ start, headers }) {
   return { resp, url };
 }
 
+/**
+ * Seed data generator: creates ~120 rows so your UI can show lots of data
+ * even if SEC live fetching is empty/rate-limited.
+ */
 function seedRows() {
+  const companies = [
+    ["AAPL", "Apple Inc."],
+    ["MSFT", "Microsoft Corp."],
+    ["AMZN", "Amazon.com, Inc."],
+    ["GOOGL", "Alphabet Inc."],
+    ["META", "Meta Platforms, Inc."],
+    ["NVDA", "NVIDIA Corp."],
+    ["TSLA", "Tesla, Inc."],
+    ["JPM", "JPMorgan Chase & Co."],
+    ["BAC", "Bank of America Corp."],
+    ["WMT", "Walmart Inc."],
+    ["COST", "Costco Wholesale Corp."],
+    ["NKE", "Nike, Inc."],
+    ["DIS", "Walt Disney Co."],
+    ["NFLX", "Netflix, Inc."],
+    ["CRM", "Salesforce, Inc."],
+    ["ORCL", "Oracle Corp."],
+    ["PEP", "PepsiCo, Inc."],
+    ["KO", "Coca-Cola Co."],
+    ["XOM", "Exxon Mobil Corp."],
+    ["CVX", "Chevron Corp."],
+    ["UNH", "UnitedHealth Group Inc."],
+    ["ABBV", "AbbVie Inc."],
+    ["LLY", "Eli Lilly and Co."],
+    ["PFE", "Pfizer Inc."],
+    ["INTC", "Intel Corp."],
+    ["AMD", "Advanced Micro Devices, Inc."],
+    ["QCOM", "QUALCOMM Inc."],
+    ["ADBE", "Adobe Inc."],
+    ["V", "Visa Inc."],
+    ["MA", "Mastercard Inc."],
+  ];
+
+  const people = [
+    ["CEO", "Alex Kim"],
+    ["CEO", "Jordan Lee"],
+    ["CEO", "Taylor Nguyen"],
+    ["CFO", "Morgan Patel"],
+    ["CFO", "Casey Chen"],
+    ["Director", "Riley Brooks"],
+    ["Director", "Avery Johnson"],
+    ["EVP", "Parker Rivera"],
+    ["President", "Cameron Singh"],
+    ["Chairman", "Quinn Davis"],
+  ];
+
+  const pick = (arr, i) => arr[i % arr.length];
+
+  // deterministic pseudo-random (no Math.random() variance between calls)
+  const prng = (i) => {
+    // simple hash-like number in (0..1)
+    const x = Math.sin(i * 999) * 10000;
+    return x - Math.floor(x);
+  };
+
   const today = new Date();
   const daysAgo = (n) => {
     const d = new Date(today);
@@ -243,158 +325,133 @@ function seedRows() {
     return d.toISOString().slice(0, 10);
   };
 
-  return [
-    {
-      id: "cook-nke-2025-12-22",
-      insiderName: "Timothy D. Cook",
-      insiderTitle: "CEO",
-      employerTicker: "AAPL",
-      employerCompany: "Apple Inc.",
-      purchasedTicker: "NKE",
-      purchasedCompany: "Nike Inc.",
-      shares: 50000,
-      pricePerShare: 103.25,
-      totalValue: 5162500,
-      transactionDate: "2025-12-22",
-      signalScore: 92,
-      purchaseType: "external",
-    },
-    {
-      id: "nadella-msft-2025-12-21",
-      insiderName: "Satya Nadella",
-      insiderTitle: "CEO",
-      employerTicker: "MSFT",
-      employerCompany: "Microsoft Corp.",
-      purchasedTicker: "MSFT",
-      purchasedCompany: "Microsoft Corp.",
-      shares: 25000,
-      pricePerShare: 412.15,
-      totalValue: 10303750,
-      transactionDate: "2025-12-21",
-      signalScore: 88,
-      purchaseType: "own-company",
-    },
-    {
-      id: "demo-1",
-      insiderName: "Jane Doe",
-      insiderTitle: "CFO",
-      employerTicker: "DEMO",
-      employerCompany: "Demo Holdings",
-      purchasedTicker: "DEMO",
-      purchasedCompany: "Demo Holdings",
-      shares: 12000,
-      pricePerShare: 27.4,
-      totalValue: 328800,
-      transactionDate: daysAgo(4),
-      signalScore: 74,
-      purchaseType: "own-company",
-    },
-    {
-      id: "demo-2",
-      insiderName: "John Smith",
-      insiderTitle: "Director",
-      employerTicker: "ACME",
-      employerCompany: "Acme Corp.",
-      purchasedTicker: "ACME",
-      purchasedCompany: "Acme Corp.",
-      shares: 8000,
-      pricePerShare: 55.1,
-      totalValue: 440800,
-      transactionDate: daysAgo(9),
-      signalScore: 67,
-      purchaseType: "own-company",
-    },
-    {
-      id: "demo-3",
-      insiderName: "Alex Kim",
-      insiderTitle: "CEO",
-      employerTicker: "RIVR",
-      employerCompany: "River Tech",
-      purchasedTicker: "RIVR",
-      purchasedCompany: "River Tech",
-      shares: 20000,
-      pricePerShare: 14.75,
-      totalValue: 295000,
-      transactionDate: daysAgo(12),
-      signalScore: 59,
-      purchaseType: "own-company",
-    },
-  ];
+  const out = [];
+  const ROWS = 120;
+
+  for (let i = 0; i < ROWS; i++) {
+    const [pTitle, pName] = pick(people, i);
+    const [empT, empC] = pick(companies, i * 3);
+    const [buyT, buyC] = pick(companies, i * 3 + 7);
+
+    const r1 = prng(i + 1);
+    const r2 = prng(i + 2);
+    const r3 = prng(i + 3);
+
+    const price = Number((5 + r1 * 495).toFixed(2));           // $5 - $500
+    const shares = Math.floor(500 + r2 * 75000);               // 500 - 75,500
+    const totalValue = Math.round(price * shares);
+
+    const purchaseType =
+      r3 < 0.15 ? "option-exercise" : empT === buyT ? "own-company" : "external";
+
+    const transactionDate = daysAgo(1 + Math.floor(prng(i + 10) * 29)); // last ~30 days
+
+    const row = {
+      id: `${pName.replace(/\s+/g, "-")}-${buyT}-${transactionDate}-${i}`,
+      insiderName: pName,
+      insiderTitle: pTitle,
+      employerTicker: empT,
+      employerCompany: empC,
+      purchasedTicker: buyT,
+      purchasedCompany: buyC,
+      shares,
+      pricePerShare: price,
+      totalValue,
+      transactionDate,
+      signalScore: 0,
+      purchaseType,
+    };
+
+    row.signalScore = calcSignalScore(row);
+    out.push(row);
+  }
+
+  // Sort so UI “Market Signals” feels real
+  out.sort((a, b) => (b.signalScore || 0) - (a.signalScore || 0));
+  return out;
+}
+
+function paginate(allRows, page, pageSize) {
+  const total = allRows.length;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const p = clamp(page, 1, totalPages);
+  const offset = (p - 1) * pageSize;
+  const data = allRows.slice(offset, offset + pageSize);
+  return { data, total, page: p, pageSize, offset, totalPages };
 }
 
 export default async function handler(req, res) {
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.setHeader("Cache-Control", "s-maxage=300, stale-while-revalidate=3600");
 
-  const debug = q(req, "debug") === "1";
-  const wrap = q(req, "wrap") === "1"; // when wrap=1, return {data, meta, debug?}
+  const wrap = String(req.query.wrap || "") === "1";
+  const debug = String(req.query.debug || "") === "1";
+  const mode = safeText(req.query.mode || "live"); // live | seed
+  const v = safeText(req.query.v || ""); // cache buster
 
-  const modeRaw = q(req, "mode"); // "seed" forces demo mode
-  const mode = modeRaw.toLowerCase();
+  const pageSize = clamp(toInt(req.query.pageSize, 50), 1, 100);
+  const page = clamp(toInt(req.query.page, 1), 1, 9999);
+  const days = clamp(toInt(req.query.days, 30), 1, 365);
 
-  const limit = clamp(toInt(q(req, "limit", "50"), 50), 1, 100);
+  // Live crawling constraints (serverless-friendly)
+  const pages = clamp(toInt(req.query.pages, 1), 1, 3);
+  const scanCap = clamp(toInt(req.query.scan, 25), 10, 60);
+  const betweenCallsMs = clamp(toInt(req.query.throttle, 350), 200, 900);
+  const TIME_BUDGET_MS = clamp(toInt(req.query.budget, 6000), 2500, 9000);
 
-  // Pagination (optional)
-  const pageSize = clamp(toInt(q(req, "pageSize", String(limit)), limit), 1, 100);
-  const page = clamp(toInt(q(req, "page", "1"), 1), 1, 100000);
-  const offset = clamp(toInt(q(req, "offset", String((page - 1) * pageSize)), (page - 1) * pageSize), 0, 1000000);
+  const startedAt = Date.now();
+  const timeLeft = () => TIME_BUDGET_MS - (Date.now() - startedAt);
 
-  const days = clamp(toInt(q(req, "days", "30"), 30), 1, 365);
-
-  // serverless safety bounds
-  const pages = clamp(toInt(q(req, "pages", "2"), 2), 1, 3);
-  const scanCap = clamp(toInt(q(req, "scan", "35"), 35), 10, 60);
-  const betweenCallsMs = clamp(toInt(q(req, "throttle", "350"), 350), 200, 900);
-  const TIME_BUDGET_MS = clamp(toInt(q(req, "budget", "6000"), 6000), 2500, 9000);
-
-  // Cache key must include mode + paging settings that matter.
-  // We cache FULL data, paging is applied after.
-  const cacheKey = `mode=${mode || "live"}|days=${days}|pages=${pages}|scan=${scanCap}|throttle=${betweenCallsMs}|budget=${TIME_BUDGET_MS}`;
-
-  // Seed mode: ALWAYS return demo rows (no SEC, no cache confusion)
-  if (mode === "seed") {
-    const full = seedRows();
-    const sliced = full.slice(offset, offset + pageSize);
-    if (wrap || debug) {
-      return res.status(200).json({
-        data: sliced,
-        meta: { total: full.length, page, pageSize, offset, mode: "seed" },
-        debug: debug ? { modeDetected: modeRaw, served: "seed" } : undefined,
-      });
-    }
-    return res.status(200).json(sliced);
-  }
-
-  // Live mode requires SEC user agent
-  const SEC_UA = process.env.SEC_USER_AGENT;
-  if (!SEC_UA) {
-    return res.status(500).json({
-      error: "Missing SEC_USER_AGENT env var",
-      hint: 'Set SEC_USER_AGENT like: "InsiderScope (your_email@example.com)"',
-    });
-  }
-
-  // Memory cache (full data)
+  const cacheKey = `wrap=${wrap}|debug=${debug}|mode=${mode}|days=${days}|pageSize=${pageSize}|page=${page}|pages=${pages}|scan=${scanCap}|throttle=${betweenCallsMs}|budget=${TIME_BUDGET_MS}|v=${v}`;
   const now = Date.now();
   const cacheTtlMs = 5 * 60 * 1000;
 
-  if (
-    memCache.data &&
-    memCache.key === cacheKey &&
-    now - memCache.ts < cacheTtlMs
-  ) {
-    const full = memCache.data;
-    const sliced = full.slice(offset, offset + pageSize);
+  if (memCache.data && memCache.key === cacheKey && now - memCache.ts < cacheTtlMs) {
+    return res.status(200).json(memCache.data);
+  }
 
-    if (wrap || debug) {
-      return res.status(200).json({
-        data: sliced,
-        meta: { total: full.length, page, pageSize, offset, mode: "live", cache: "mem-hit" },
-        debug: debug ? { cacheKey, cache: "mem-hit" } : undefined,
-      });
-    }
+  // SEED MODE: always return seed (paginated)
+  if (mode === "seed") {
+    const all = seedRows();
+    const pg = paginate(all, page, pageSize);
 
-    return res.status(200).json(sliced);
+    const payload = {
+      data: pg.data,
+      meta: {
+        total: pg.total,
+        page: pg.page,
+        pageSize: pg.pageSize,
+        offset: pg.offset,
+        totalPages: pg.totalPages,
+        mode: "seed",
+        source: "seed",
+      },
+      ...(debug
+        ? {
+            debug: {
+              cache: "seed",
+              timeSpentMs: Date.now() - startedAt,
+            },
+          }
+        : {}),
+    };
+
+    memCache.ts = Date.now();
+    memCache.key = cacheKey;
+    memCache.data = payload;
+
+    // If wrap=0 (older clients), return just array
+    return res.status(200).json(wrap ? payload : pg.data);
+  }
+
+  // LIVE MODE: fetch SEC, fall back to seed if empty
+  const SEC_UA = process.env.SEC_USER_AGENT;
+  if (!SEC_UA) {
+    const payload = {
+      error: "Missing SEC_USER_AGENT env var",
+      hint: 'Set SEC_USER_AGENT like: "InsiderScope (your_email@example.com)"',
+    };
+    return res.status(500).json(payload);
   }
 
   const headers = {
@@ -404,8 +461,6 @@ export default async function handler(req, res) {
   };
 
   const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
-  const startedAt = Date.now();
-  const timeLeft = () => TIME_BUDGET_MS - (Date.now() - startedAt);
 
   const out = [];
   const errorsSample = [];
@@ -482,7 +537,6 @@ export default async function handler(req, res) {
         }
 
         const xmlText = await xmlResp.text();
-
         const dbg = debug ? {} : null;
         const purchases = parseForm4Purchases(xmlText, dbg);
 
@@ -502,7 +556,7 @@ export default async function handler(req, res) {
           const nm = pch.ownerName || "—";
           const id = `${nm}-${sym}-${dt}-${Math.random().toString(16).slice(2)}`;
 
-          out.push({
+          const row = {
             id,
             insiderName: nm,
             insiderTitle: pch.officerTitle || "—",
@@ -514,9 +568,12 @@ export default async function handler(req, res) {
             pricePerShare: pch.pricePerShare,
             totalValue: pch.totalValue,
             transactionDate: dt,
-            signalScore: 50,
+            signalScore: 0,
             purchaseType: "own-company",
-          });
+          };
+
+          row.signalScore = calcSignalScore(row);
+          out.push(row);
         }
       } catch (e) {
         errorsSample.push({ where: "loop", error: String(e) });
@@ -524,32 +581,45 @@ export default async function handler(req, res) {
     }
   }
 
-  // If live yields nothing, fallback to seed rows so UI never goes empty.
-  const full = out.length ? out : seedRows();
+  // Sort + paginate live rows
+  out.sort((a, b) => (b.signalScore || 0) - (a.signalScore || 0));
+  const livePg = paginate(out, page, pageSize);
 
-  // cache FULL
-  memCache.ts = Date.now();
-  memCache.key = cacheKey;
-  memCache.data = full;
+  // If live returned nothing, fall back to seed
+  let finalData = livePg.data;
+  let finalMeta = {
+    total: livePg.total,
+    page: livePg.page,
+    pageSize: livePg.pageSize,
+    offset: livePg.offset,
+    totalPages: livePg.totalPages,
+    mode: "live",
+    source: "live",
+  };
 
-  const sliced = full.slice(offset, offset + pageSize);
+  if (out.length === 0) {
+    const allSeed = seedRows();
+    const seedPg = paginate(allSeed, page, pageSize);
+    finalData = seedPg.data;
+    finalMeta = {
+      total: seedPg.total,
+      page: seedPg.page,
+      pageSize: seedPg.pageSize,
+      offset: seedPg.offset,
+      totalPages: seedPg.totalPages,
+      mode: "live",
+      source: "fallback-seed",
+    };
+  }
 
-  if (wrap || debug) {
-    return res.status(200).json({
-      data: sliced,
-      meta: {
-        total: full.length,
-        page,
-        pageSize,
-        offset,
-        mode: "live",
-        source: out.length ? "live" : "fallback-seed",
-      },
-      debug: debug
-        ? {
-            cache: out.length ? "miss-fill" : "fallback-seed",
+  const payload = {
+    data: finalData,
+    meta: finalMeta,
+    ...(debug
+      ? {
+          debug: {
+            cache: finalMeta.source,
             returnedLive: out.length,
-            totalServed: full.length,
             entriesSeen: entriesSeenTotal,
             cutoff: new Date(cutoff).toISOString(),
             scanCap,
@@ -559,10 +629,14 @@ export default async function handler(req, res) {
             timeSpentMs: Date.now() - startedAt,
             errorsSample,
             samples,
-          }
-        : undefined,
-    });
-  }
+          },
+        }
+      : {}),
+  };
 
-  return res.status(200).json(sliced);
+  memCache.ts = Date.now();
+  memCache.key = cacheKey;
+  memCache.data = payload;
+
+  return res.status(200).json(wrap ? payload : payload.data);
 }
