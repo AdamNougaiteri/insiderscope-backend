@@ -1,0 +1,14 @@
+name: Ingest Insider Buys
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call ingest endpoint
+        run: |
+          curl -sS "https://insiderscope-backend.vercel.app/api/ingest?mode=run&pageSize=50&maxPages=2&days=30&throttleMs=700"
