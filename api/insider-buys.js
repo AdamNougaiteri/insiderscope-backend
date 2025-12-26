@@ -17,6 +17,16 @@ globalThis.__INSIDER_CACHE__ = globalThis.__INSIDER_CACHE__ || {
 };
 const memCache = globalThis.__INSIDER_CACHE__;
 
+/** Strip XML namespace prefixes so <ns1:tag> becomes <tag> */
+function stripNamespaces(xml) {
+  if (!xml) return "";
+  // remove xmlns="..." declarations (optional)
+  let out = xml.replace(/\sxmlns(:\w+)?="[^"]*"/g, "");
+  // replace opening tags <ns:Tag ...> -> <Tag ...>
+  out = out.replace(/<(\/*)\w+:(\w+)([^>]*)>/g, "<$1$2$3>");
+  return out;
+}
+
 function pickArchivesLink(entry) {
   const links = entry?.link;
   if (!links) return "";
@@ -56,10 +66,11 @@ function pickForm4Xml(indexJson) {
     .filter(Boolean)
     .filter((n) => n.toLowerCase().endsWith(".xml"));
 
-  // Prefer "form4" or "primary", otherwise first xml
+  // Prefer likely Form 4 doc names
   return (
     xmls.find((n) => n.toLowerCase().includes("form4")) ||
     xmls.find((n) => n.toLowerCase().includes("primary")) ||
+    xmls.find((n) => n.toLowerCase().includes("ownership")) ||
     xmls[0] ||
     null
   );
@@ -77,16 +88,16 @@ function parseAtom(xml) {
   return entries;
 }
 
-// ---------- Regex-based Form 4 parsing (robust) ----------
+// ---------- Regex-based Form 4 parsing (namespace-safe after stripNamespaces) ----------
 function firstTag(xml, tag) {
-  const re = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i");
+  const re = new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i");
   const m = xml.match(re);
   return m ? safeText(m[1]) : "";
 }
 
 function firstNestedTag(xml, parentTag, childTag) {
   const parentRe = new RegExp(
-    `<${parentTag}[^>]*>([\\s\\S]*?)<\\/${parentTag}>`,
+    `<${parentTag}\\b[^>]*>([\\s\\S]*?)<\\/${parentTag}>`,
     "i"
   );
   const pm = xml.match(parentRe);
@@ -96,7 +107,6 @@ function firstNestedTag(xml, parentTag, childTag) {
 }
 
 function parseNumberTag(block, tag) {
-  // handles <tag><value>123</value></tag> or <tag>123</tag>
   const inner = firstTag(block, tag);
   if (!inner) return null;
   const v = firstTag(inner, "value") || inner;
@@ -111,27 +121,27 @@ function parseDateTag(block, tag) {
   return isoDateOnly(v);
 }
 
-function parseForm4PurchasesRegex(xmlText) {
+function parseForm4PurchasesRegex(xmlTextRaw) {
+  const xmlText = stripNamespaces(xmlTextRaw);
+
   const issuerTradingSymbol =
     firstNestedTag(xmlText, "issuer", "issuerTradingSymbol") ||
     firstTag(xmlText, "issuerTradingSymbol");
 
   const issuerName =
-    firstNestedTag(xmlText, "issuer", "issuerName") || firstTag(xmlText, "issuerName");
+    firstNestedTag(xmlText, "issuer", "issuerName") ||
+    firstTag(xmlText, "issuerName");
 
-  // reporting owner name/title can appear multiple times; take first match
-  const ownerName =
-    firstTag(xmlText, "rptOwnerName") || firstTag(xmlText, "reportingOwnerName");
-
+  const ownerName = firstTag(xmlText, "rptOwnerName") || firstTag(xmlText, "reportingOwnerName");
   const officerTitle = firstTag(xmlText, "officerTitle");
 
-  // grab all nonDerivativeTransaction blocks
+  // nonDerivativeTransaction blocks (after stripping namespaces this matches)
   const txBlocks = [];
-  const txRe = /<nonDerivativeTransaction[^>]*>([\s\S]*?)<\/nonDerivativeTransaction>/gi;
+  const txRe = /<nonDerivativeTransaction\b[^>]*>([\s\S]*?)<\/nonDerivativeTransaction>/gi;
   let m;
   while ((m = txRe.exec(xmlText)) !== null) {
     txBlocks.push(m[1]);
-    if (txBlocks.length > 200) break;
+    if (txBlocks.length > 400) break;
   }
 
   const purchases = [];
@@ -142,10 +152,7 @@ function parseForm4PurchasesRegex(xmlText) {
 
     if (safeText(code) !== "P") continue;
 
-    const shares =
-      parseNumberTag(block, "transactionShares") ??
-      parseNumberTag(block, "transactionSharesValue");
-
+    const shares = parseNumberTag(block, "transactionShares");
     const price = parseNumberTag(block, "transactionPricePerShare");
     const date = parseDateTag(block, "transactionDate");
 
@@ -188,11 +195,7 @@ export default async function handler(req, res) {
   const now = Date.now();
   const cacheTtlMs = 5 * 60 * 1000;
 
-  if (
-    memCache.data &&
-    memCache.key === cacheKey &&
-    now - memCache.ts < cacheTtlMs
-  ) {
+  if (memCache.data && memCache.key === cacheKey && now - memCache.ts < cacheTtlMs) {
     return res.status(200).json(
       debug
         ? { data: memCache.data, debug: { cache: "mem-hit", limit, days, scanCap } }
@@ -218,7 +221,13 @@ export default async function handler(req, res) {
           debug
             ? {
                 data: memCache.data,
-                debug: { cache: "mem-stale-after-429", limit, days, scanCap, atomStatus: 429 },
+                debug: {
+                  cache: "mem-stale-after-429",
+                  limit,
+                  days,
+                  scanCap,
+                  atomStatus: 429,
+                },
               }
             : memCache.data
         );
@@ -298,14 +307,15 @@ export default async function handler(req, res) {
       const xmlText = await xmlResp.text();
       const purchases = parseForm4PurchasesRegex(xmlText);
 
-      if (debug && samples.length < 5) {
+      if (debug && samples.length < 10) {
+        const norm = stripNamespaces(xmlText);
         samples.push({
           idxUrl,
           xmlUrl,
           xmlName,
           purchasesFound: purchases.length,
-          issuerTradingSymbol: firstTag(xmlText, "issuerTradingSymbol"),
-          rptOwnerName: firstTag(xmlText, "rptOwnerName"),
+          issuerTradingSymbol: firstTag(norm, "issuerTradingSymbol"),
+          rptOwnerName: firstTag(norm, "rptOwnerName"),
         });
       }
 
