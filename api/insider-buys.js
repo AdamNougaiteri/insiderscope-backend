@@ -108,36 +108,60 @@ function valueField(node) {
   return node;
 }
 
-// Simple signal scoring (shared for seed + live rows)
-function calcSignalScore({ insiderTitle, totalValue, transactionDate, purchaseType }) {
-  let score = 0;
+function collectFootnoteAndRemarksText(root) {
+  const texts = [];
 
-  const title = String(insiderTitle || "").toLowerCase();
-  if (title.includes("ceo") || title.includes("chief executive")) score += 40;
-  else if (title.includes("cfo") || title.includes("chief financial")) score += 35;
-  else if (title.includes("director") || title.includes("chairman")) score += 25;
-  else if (title.includes("president") || title.includes("evp")) score += 20;
-  else score += 10;
+  // remarks can be string or { value: ... }
+  const remarks =
+    safeText(valueField(root?.remarks)) ||
+    safeText(valueField(root?.remarks?.value)) ||
+    "";
+  if (remarks) texts.push(remarks);
 
-  const val = Number(totalValue || 0);
-  if (val > 1000000) score += 40;
-  else if (val > 500000) score += 30;
-  else if (val > 100000) score += 20;
-  else if (val > 50000) score += 10;
-  else score += 5;
+  // footnotes: can be nested
+  const footnoteNodes = [];
+  // common
+  footnoteNodes.push(...ensureArray(root?.footnotes?.footnote));
+  // fallback deep search
+  const deep = deepFindAll(root, "footnote");
+  for (const d of deep) footnoteNodes.push(...ensureArray(d));
 
-  const dt = new Date(transactionDate || new Date());
-  const now = new Date();
-  const diffDays = Math.ceil(Math.abs(now.getTime() - dt.getTime()) / (1000 * 60 * 60 * 24));
-  if (diffDays <= 2) score += 20;
-  else if (diffDays <= 7) score += 10;
-  else score += 5;
+  for (const fn of footnoteNodes) {
+    if (!fn) continue;
+    // fn can be string, object, array
+    if (typeof fn === "string") {
+      const t = safeText(fn);
+      if (t) texts.push(t);
+      continue;
+    }
+    // some are like { value: "..." } or { "#text": "..." } or mixed
+    const candidates = [
+      fn?.value,
+      fn?.text,
+      fn?.["#text"],
+      fn?.["$text"],
+      fn,
+    ];
+    for (const c of candidates) {
+      const t = safeText(typeof c === "object" ? "" : c);
+      if (t) texts.push(t);
+    }
+  }
 
-  // Penalize option exercises a bit vs. true purchases
-  const pt = String(purchaseType || "").toLowerCase();
-  if (pt.includes("option")) score -= 10;
+  return texts.join(" \n");
+}
 
-  return Math.max(0, Math.min(100, score));
+function looksScheduled(footnotesAndRemarks) {
+  const s = safeText(footnotesAndRemarks).toLowerCase();
+  if (!s) return false;
+  // best-effort heuristics
+  return (
+    s.includes("10b5-1") ||
+    s.includes("10b5 1") ||
+    s.includes("rule 10b5") ||
+    s.includes("10b5 plan") ||
+    s.includes("trading plan")
+  );
 }
 
 function parseForm4Purchases(xmlTextRaw, debugCapture = null) {
@@ -177,6 +201,9 @@ function parseForm4Purchases(xmlTextRaw, debugCapture = null) {
     safeText(root?.officerTitle) ||
     "";
 
+  const notesText = collectFootnoteAndRemarksText(root);
+  const isScheduled = looksScheduled(notesText);
+
   let txs =
     root?.nonDerivativeTable?.nonDerivativeTransaction ??
     root?.nonDerivativeTransaction ??
@@ -201,6 +228,7 @@ function parseForm4Purchases(xmlTextRaw, debugCapture = null) {
     }
     debugCapture.nonDerivCount = txs.length;
     debugCapture.codes = codes;
+    debugCapture.isScheduled = isScheduled;
   }
 
   const purchases = [];
@@ -211,7 +239,6 @@ function parseForm4Purchases(xmlTextRaw, debugCapture = null) {
         t?.transactionCode ??
         ""
     );
-    // Keep strict: only true purchases
     if (code !== "P") continue;
 
     const shares = numVal(
@@ -235,6 +262,8 @@ function parseForm4Purchases(xmlTextRaw, debugCapture = null) {
 
     if (!Number.isFinite(shares) || !Number.isFinite(price)) continue;
 
+    const totalValue = Math.round(shares * price);
+
     purchases.push({
       issuerTradingSymbol,
       issuerName,
@@ -243,7 +272,8 @@ function parseForm4Purchases(xmlTextRaw, debugCapture = null) {
       shares,
       pricePerShare: price,
       transactionDate: date,
-      totalValue: Math.round(shares * price),
+      totalValue,
+      isScheduled,
     });
   }
 
@@ -258,66 +288,8 @@ async function fetchAtomPage({ start, headers }) {
   return { resp, url };
 }
 
-/**
- * Seed data generator: creates ~120 rows so your UI can show lots of data
- * even if SEC live fetching is empty/rate-limited.
- */
+// Demo/seed data
 function seedRows() {
-  const companies = [
-    ["AAPL", "Apple Inc."],
-    ["MSFT", "Microsoft Corp."],
-    ["AMZN", "Amazon.com, Inc."],
-    ["GOOGL", "Alphabet Inc."],
-    ["META", "Meta Platforms, Inc."],
-    ["NVDA", "NVIDIA Corp."],
-    ["TSLA", "Tesla, Inc."],
-    ["JPM", "JPMorgan Chase & Co."],
-    ["BAC", "Bank of America Corp."],
-    ["WMT", "Walmart Inc."],
-    ["COST", "Costco Wholesale Corp."],
-    ["NKE", "Nike, Inc."],
-    ["DIS", "Walt Disney Co."],
-    ["NFLX", "Netflix, Inc."],
-    ["CRM", "Salesforce, Inc."],
-    ["ORCL", "Oracle Corp."],
-    ["PEP", "PepsiCo, Inc."],
-    ["KO", "Coca-Cola Co."],
-    ["XOM", "Exxon Mobil Corp."],
-    ["CVX", "Chevron Corp."],
-    ["UNH", "UnitedHealth Group Inc."],
-    ["ABBV", "AbbVie Inc."],
-    ["LLY", "Eli Lilly and Co."],
-    ["PFE", "Pfizer Inc."],
-    ["INTC", "Intel Corp."],
-    ["AMD", "Advanced Micro Devices, Inc."],
-    ["QCOM", "QUALCOMM Inc."],
-    ["ADBE", "Adobe Inc."],
-    ["V", "Visa Inc."],
-    ["MA", "Mastercard Inc."],
-  ];
-
-  const people = [
-    ["CEO", "Alex Kim"],
-    ["CEO", "Jordan Lee"],
-    ["CEO", "Taylor Nguyen"],
-    ["CFO", "Morgan Patel"],
-    ["CFO", "Casey Chen"],
-    ["Director", "Riley Brooks"],
-    ["Director", "Avery Johnson"],
-    ["EVP", "Parker Rivera"],
-    ["President", "Cameron Singh"],
-    ["Chairman", "Quinn Davis"],
-  ];
-
-  const pick = (arr, i) => arr[i % arr.length];
-
-  // deterministic pseudo-random (no Math.random() variance between calls)
-  const prng = (i) => {
-    // simple hash-like number in (0..1)
-    const x = Math.sin(i * 999) * 10000;
-    return x - Math.floor(x);
-  };
-
   const today = new Date();
   const daysAgo = (n) => {
     const d = new Date(today);
@@ -325,84 +297,188 @@ function seedRows() {
     return d.toISOString().slice(0, 10);
   };
 
-  const out = [];
-  const ROWS = 120;
-
-  for (let i = 0; i < ROWS; i++) {
-    const [pTitle, pName] = pick(people, i);
-    const [empT, empC] = pick(companies, i * 3);
-    const [buyT, buyC] = pick(companies, i * 3 + 7);
-
-    const r1 = prng(i + 1);
-    const r2 = prng(i + 2);
-    const r3 = prng(i + 3);
-
-    const price = Number((5 + r1 * 495).toFixed(2));           // $5 - $500
-    const shares = Math.floor(500 + r2 * 75000);               // 500 - 75,500
-    const totalValue = Math.round(price * shares);
-
-    const purchaseType =
-      r3 < 0.15 ? "option-exercise" : empT === buyT ? "own-company" : "external";
-
-    const transactionDate = daysAgo(1 + Math.floor(prng(i + 10) * 29)); // last ~30 days
-
-    const row = {
-      id: `${pName.replace(/\s+/g, "-")}-${buyT}-${transactionDate}-${i}`,
-      insiderName: pName,
-      insiderTitle: pTitle,
-      employerTicker: empT,
-      employerCompany: empC,
-      purchasedTicker: buyT,
-      purchasedCompany: buyC,
-      shares,
-      pricePerShare: price,
-      totalValue,
-      transactionDate,
-      signalScore: 0,
-      purchaseType,
-    };
-
-    row.signalScore = calcSignalScore(row);
-    out.push(row);
-  }
-
-  // Sort so UI “Market Signals” feels real
-  out.sort((a, b) => (b.signalScore || 0) - (a.signalScore || 0));
-  return out;
+  return [
+    {
+      id: "cook-nke-2025-12-22",
+      insiderName: "Timothy D. Cook",
+      insiderTitle: "CEO",
+      employerTicker: "AAPL",
+      employerCompany: "Apple Inc.",
+      purchasedTicker: "NKE",
+      purchasedCompany: "Nike Inc.",
+      shares: 50000,
+      pricePerShare: 103.25,
+      totalValue: 5162500,
+      transactionDate: "2025-12-22",
+      signalScore: 92,
+      purchaseType: "external",
+      isScheduled: false,
+    },
+    {
+      id: "nadella-msft-2025-12-21",
+      insiderName: "Satya Nadella",
+      insiderTitle: "CEO",
+      employerTicker: "MSFT",
+      employerCompany: "Microsoft Corp.",
+      purchasedTicker: "MSFT",
+      purchasedCompany: "Microsoft Corp.",
+      shares: 25000,
+      pricePerShare: 412.15,
+      totalValue: 10303750,
+      transactionDate: "2025-12-21",
+      signalScore: 88,
+      purchaseType: "own-company",
+      isScheduled: false,
+    },
+    {
+      id: "demo-1",
+      insiderName: "Jane Doe",
+      insiderTitle: "CFO",
+      employerTicker: "DEMO",
+      employerCompany: "Demo Holdings",
+      purchasedTicker: "DEMO",
+      purchasedCompany: "Demo Holdings",
+      shares: 12000,
+      pricePerShare: 27.4,
+      totalValue: 328800,
+      transactionDate: daysAgo(4),
+      signalScore: 74,
+      purchaseType: "own-company",
+      isScheduled: false,
+    },
+    {
+      id: "demo-2",
+      insiderName: "John Smith",
+      insiderTitle: "Director",
+      employerTicker: "ACME",
+      employerCompany: "Acme Corp.",
+      purchasedTicker: "ACME",
+      purchasedCompany: "Acme Corp.",
+      shares: 8000,
+      pricePerShare: 55.1,
+      totalValue: 440800,
+      transactionDate: daysAgo(9),
+      signalScore: 67,
+      purchaseType: "own-company",
+      isScheduled: true, // example scheduled flag
+    },
+    {
+      id: "demo-3",
+      insiderName: "Alex Kim",
+      insiderTitle: "CEO",
+      employerTicker: "RIVR",
+      employerCompany: "River Tech",
+      purchasedTicker: "RIVR",
+      purchasedCompany: "River Tech",
+      shares: 20000,
+      pricePerShare: 14.75,
+      totalValue: 295000,
+      transactionDate: daysAgo(12),
+      signalScore: 59,
+      purchaseType: "own-company",
+      isScheduled: false,
+    },
+  ];
 }
 
-function paginate(allRows, page, pageSize) {
-  const total = allRows.length;
-  const totalPages = Math.max(1, Math.ceil(total / pageSize));
-  const p = clamp(page, 1, totalPages);
-  const offset = (p - 1) * pageSize;
-  const data = allRows.slice(offset, offset + pageSize);
-  return { data, total, page: p, pageSize, offset, totalPages };
+function buildGroups(rows) {
+  // Group “multiple execs buying same company”
+  // We focus on: own-company purchases, NOT scheduled, totalValue > 0
+  const m = new Map();
+
+  for (const r of rows) {
+    const sym = safeText(r.purchasedTicker || "");
+    if (!sym) continue;
+
+    const purchaseType = safeText(r.purchaseType || "");
+    const isScheduled = !!r.isScheduled;
+
+    // “non scheduled purchases” heuristic:
+    if (purchaseType !== "own-company") continue;
+    if (isScheduled) continue;
+    if (!Number.isFinite(Number(r.totalValue)) || Number(r.totalValue) <= 0) continue;
+
+    const key = sym.toUpperCase();
+    if (!m.has(key)) {
+      m.set(key, {
+        purchasedTicker: key,
+        purchasedCompany: safeText(r.purchasedCompany || r.employerCompany || ""),
+        execCount: 0,
+        uniqueInsiders: new Set(),
+        totalValue: 0,
+        latestDate: safeText(r.transactionDate || ""),
+        insiders: [],
+      });
+    }
+
+    const g = m.get(key);
+    const insider = safeText(r.insiderName || "—");
+
+    if (!g.uniqueInsiders.has(insider)) {
+      g.uniqueInsiders.add(insider);
+      g.insiders.push({
+        insiderName: insider,
+        insiderTitle: safeText(r.insiderTitle || ""),
+        totalValue: Number(r.totalValue) || 0,
+        transactionDate: safeText(r.transactionDate || ""),
+      });
+    }
+
+    g.totalValue += Number(r.totalValue) || 0;
+
+    const dt = safeText(r.transactionDate || "");
+    if (dt && (!g.latestDate || dt > g.latestDate)) g.latestDate = dt;
+  }
+
+  const groups = Array.from(m.values()).map((g) => {
+    g.execCount = g.uniqueInsiders.size;
+    delete g.uniqueInsiders;
+    // sort insider list by value desc
+    g.insiders.sort((a, b) => (b.totalValue || 0) - (a.totalValue || 0));
+    return g;
+  });
+
+  // Rank: more execs first, then bigger $ value
+  groups.sort((a, b) => {
+    if (b.execCount !== a.execCount) return b.execCount - a.execCount;
+    return (b.totalValue || 0) - (a.totalValue || 0);
+  });
+
+  return groups;
 }
 
 export default async function handler(req, res) {
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.setHeader("Cache-Control", "s-maxage=300, stale-while-revalidate=3600");
 
-  const wrap = String(req.query.wrap || "") === "1";
+  const SEC_UA = process.env.SEC_USER_AGENT;
+  if (!SEC_UA) {
+    return res.status(500).json({
+      error: "Missing SEC_USER_AGENT env var",
+      hint: 'Set SEC_USER_AGENT like: "InsiderScope (your_email@example.com)"',
+    });
+  }
+
   const debug = String(req.query.debug || "") === "1";
-  const mode = safeText(req.query.mode || "live"); // live | seed
-  const v = safeText(req.query.v || ""); // cache buster
+  const mode = safeText(req.query.mode || ""); // "seed"
+  const v = safeText(req.query.v || "");
+  const wrap = String(req.query.wrap || "") === "1";
+  const includeGroups = String(req.query.includeGroups || "") === "1";
 
   const pageSize = clamp(toInt(req.query.pageSize, 50), 1, 100);
-  const page = clamp(toInt(req.query.page, 1), 1, 9999);
-  const days = clamp(toInt(req.query.days, 30), 1, 365);
+  const page = clamp(toInt(req.query.page, 1), 1, 500);
+  const offset = (page - 1) * pageSize;
 
-  // Live crawling constraints (serverless-friendly)
-  const pages = clamp(toInt(req.query.pages, 1), 1, 3);
-  const scanCap = clamp(toInt(req.query.scan, 25), 10, 60);
+  const days = clamp(toInt(req.query.days, 30), 1, 365);
+  const pages = clamp(toInt(req.query.pages, 2), 1, 3);
+  const scanCap = clamp(toInt(req.query.scan, 35), 10, 60);
   const betweenCallsMs = clamp(toInt(req.query.throttle, 350), 200, 900);
   const TIME_BUDGET_MS = clamp(toInt(req.query.budget, 6000), 2500, 9000);
 
   const startedAt = Date.now();
   const timeLeft = () => TIME_BUDGET_MS - (Date.now() - startedAt);
 
-  const cacheKey = `wrap=${wrap}|debug=${debug}|mode=${mode}|days=${days}|pageSize=${pageSize}|page=${page}|pages=${pages}|scan=${scanCap}|throttle=${betweenCallsMs}|budget=${TIME_BUDGET_MS}|v=${v}`;
+  const cacheKey = `wrap=${wrap}|includeGroups=${includeGroups}|pageSize=${pageSize}|page=${page}|days=${days}|pages=${pages}|scan=${scanCap}|throttle=${betweenCallsMs}|budget=${TIME_BUDGET_MS}|mode=${mode}|v=${v}`;
   const now = Date.now();
   const cacheTtlMs = 5 * 60 * 1000;
 
@@ -410,48 +486,19 @@ export default async function handler(req, res) {
     return res.status(200).json(memCache.data);
   }
 
-  // SEED MODE: always return seed (paginated)
   if (mode === "seed") {
     const all = seedRows();
-    const pg = paginate(all, page, pageSize);
+    const data = all.slice(offset, offset + pageSize);
+    const meta = { total: all.length, page, pageSize, offset, mode: "seed", source: "seed" };
+    const groups = includeGroups ? buildGroups(all) : undefined;
 
-    const payload = {
-      data: pg.data,
-      meta: {
-        total: pg.total,
-        page: pg.page,
-        pageSize: pg.pageSize,
-        offset: pg.offset,
-        totalPages: pg.totalPages,
-        mode: "seed",
-        source: "seed",
-      },
-      ...(debug
-        ? {
-            debug: {
-              cache: "seed",
-              timeSpentMs: Date.now() - startedAt,
-            },
-          }
-        : {}),
-    };
+    const payload = wrap ? { data, meta, ...(includeGroups ? { groups } : {}) } : data;
 
     memCache.ts = Date.now();
     memCache.key = cacheKey;
     memCache.data = payload;
 
-    // If wrap=0 (older clients), return just array
-    return res.status(200).json(wrap ? payload : pg.data);
-  }
-
-  // LIVE MODE: fetch SEC, fall back to seed if empty
-  const SEC_UA = process.env.SEC_USER_AGENT;
-  if (!SEC_UA) {
-    const payload = {
-      error: "Missing SEC_USER_AGENT env var",
-      hint: 'Set SEC_USER_AGENT like: "InsiderScope (your_email@example.com)"',
-    };
-    return res.status(500).json(payload);
+    return res.status(200).json(payload);
   }
 
   const headers = {
@@ -466,6 +513,10 @@ export default async function handler(req, res) {
   const errorsSample = [];
   const samples = [];
   let entriesSeenTotal = 0;
+
+  // We collect more than one page worth so pagination has something to work with
+  // But keep it serverless-safe.
+  const desired = Math.min(200, offset + pageSize);
 
   for (let p = 0; p < pages; p++) {
     if (timeLeft() < 1200) break;
@@ -504,6 +555,7 @@ export default async function handler(req, res) {
       .slice(0, scanCap);
 
     for (let i = 0; i < recentEntries.length; i++) {
+      if (out.length >= desired) break;
       if (timeLeft() < 1200) break;
 
       const { linkHref, updated } = recentEntries[i];
@@ -537,6 +589,7 @@ export default async function handler(req, res) {
         }
 
         const xmlText = await xmlResp.text();
+
         const dbg = debug ? {} : null;
         const purchases = parseForm4Purchases(xmlText, dbg);
 
@@ -556,7 +609,7 @@ export default async function handler(req, res) {
           const nm = pch.ownerName || "—";
           const id = `${nm}-${sym}-${dt}-${Math.random().toString(16).slice(2)}`;
 
-          const row = {
+          out.push({
             id,
             insiderName: nm,
             insiderTitle: pch.officerTitle || "—",
@@ -568,75 +621,65 @@ export default async function handler(req, res) {
             pricePerShare: pch.pricePerShare,
             totalValue: pch.totalValue,
             transactionDate: dt,
-            signalScore: 0,
+            signalScore: 50,
             purchaseType: "own-company",
-          };
+            isScheduled: !!pch.isScheduled,
+          });
 
-          row.signalScore = calcSignalScore(row);
-          out.push(row);
+          if (out.length >= desired) break;
         }
       } catch (e) {
         errorsSample.push({ where: "loop", error: String(e) });
       }
     }
+
+    if (out.length >= desired) break;
   }
 
-  // Sort + paginate live rows
-  out.sort((a, b) => (b.signalScore || 0) - (a.signalScore || 0));
-  const livePg = paginate(out, page, pageSize);
+  // If live returns nothing, use seed as fallback so UI doesn’t die
+  const allRows = out.length ? out : seedRows();
+  const data = allRows.slice(offset, offset + pageSize);
 
-  // If live returned nothing, fall back to seed
-  let finalData = livePg.data;
-  let finalMeta = {
-    total: livePg.total,
-    page: livePg.page,
-    pageSize: livePg.pageSize,
-    offset: livePg.offset,
-    totalPages: livePg.totalPages,
+  const meta = {
+    total: allRows.length,
+    page,
+    pageSize,
+    offset,
     mode: "live",
-    source: "live",
+    source: out.length ? "live" : "fallback-seed",
   };
 
-  if (out.length === 0) {
-    const allSeed = seedRows();
-    const seedPg = paginate(allSeed, page, pageSize);
-    finalData = seedPg.data;
-    finalMeta = {
-      total: seedPg.total,
-      page: seedPg.page,
-      pageSize: seedPg.pageSize,
-      offset: seedPg.offset,
-      totalPages: seedPg.totalPages,
-      mode: "live",
-      source: "fallback-seed",
-    };
-  }
+  const groups = includeGroups ? buildGroups(allRows) : undefined;
 
-  const payload = {
-    data: finalData,
-    meta: finalMeta,
-    ...(debug
-      ? {
-          debug: {
-            cache: finalMeta.source,
-            returnedLive: out.length,
-            entriesSeen: entriesSeenTotal,
-            cutoff: new Date(cutoff).toISOString(),
-            scanCap,
-            pages,
-            throttle: betweenCallsMs,
-            budget: TIME_BUDGET_MS,
-            timeSpentMs: Date.now() - startedAt,
-            errorsSample,
-            samples,
-          },
-        }
-      : {}),
-  };
+  const payload = wrap
+    ? {
+        data,
+        meta,
+        ...(includeGroups ? { groups } : {}),
+        ...(debug
+          ? {
+              debug: {
+                cache: out.length ? "miss-fill" : "fallback-seed",
+                returnedLive: out.length,
+                totalServed: allRows.length,
+                entriesSeen: entriesSeenTotal,
+                cutoff: new Date(cutoff).toISOString(),
+                scanCap,
+                pages,
+                throttle: betweenCallsMs,
+                budget: TIME_BUDGET_MS,
+                timeSpentMs: Date.now() - startedAt,
+                errorsSample,
+                samples,
+              },
+            }
+          : {}),
+      }
+    : data;
 
   memCache.ts = Date.now();
   memCache.key = cacheKey;
   memCache.data = payload;
 
-  return res.status(200).json(wrap ? payload : payload.data);
+  return res.status(200).json(payload);
 }
