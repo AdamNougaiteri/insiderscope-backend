@@ -1,7 +1,7 @@
 import { XMLParser } from "fast-xml-parser";
 
-const SEC_FEED =
-  "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&owner=only&count=40&output=atom";
+const FEED_URL =
+  "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&owner=only&count=20&output=atom";
 
 const HEADERS = {
   "User-Agent": "InsiderScope demo contact@example.com",
@@ -13,89 +13,82 @@ const parser = new XMLParser({
   attributeNamePrefix: "",
 });
 
-// -------------------- helpers --------------------
-
-function cleanText(v) {
-  if (!v) return "";
-  return String(v).replace(/\s+/g, " ").trim();
+async function fetchXML(url) {
+  const r = await fetch(url, { headers: HEADERS });
+  if (!r.ok) throw new Error(`Fetch failed ${r.status}`);
+  return r.text();
 }
-
-function parseNumber(v) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : 0;
-}
-
-function extractCompanyAndTicker(raw) {
-  if (!raw) return { companyName: "Unknown", ticker: "UNKNOWN" };
-
-  // Examples:
-  // "4 - ONDAS HOLDINGS INC (0001646188)"
-  // "4 - IonQ, Inc. (0001824920)"
-
-  const cleaned = cleanText(raw);
-
-  // remove leading "4 -"
-  const noPrefix = cleaned.replace(/^4\s*-\s*/i, "");
-
-  // remove (CIK)
-  const companyOnly = noPrefix.replace(/\(\d+\)/g, "").trim();
-
-  return {
-    companyName: companyOnly || "Unknown",
-    ticker: "UNKNOWN", // real ticker resolution comes later
-  };
-}
-
-// -------------------- handler --------------------
 
 export default async function handler(req, res) {
   try {
-    const r = await fetch(SEC_FEED, { headers: HEADERS });
-    if (!r.ok) throw new Error(`SEC error ${r.status}`);
-
-    const xml = await r.text();
-    const feed = parser.parse(xml);
+    const feedXML = await fetchXML(FEED_URL);
+    const feed = parser.parse(feedXML);
 
     const entries = Array.isArray(feed.feed.entry)
       ? feed.feed.entry
       : [feed.feed.entry];
 
-    const transactions = [];
+    const results = [];
 
-    for (const e of entries) {
-      const title = cleanText(e.title);
-      const summary = cleanText(e.summary);
+    for (const entry of entries) {
+      const filingUrl = entry.link?.href;
+      if (!filingUrl) continue;
 
-      const { companyName, ticker } = extractCompanyAndTicker(title);
+      // Load filing page
+      const filingPage = await fetchXML(filingUrl);
 
-      const sharesMatch = summary.match(/Shares:\s*([\d,]+)/i);
-      const priceMatch = summary.match(/Price:\s*\$?([\d.]+)/i);
-
-      const shares = parseNumber(
-        sharesMatch ? sharesMatch[1].replace(/,/g, "") : 0
+      // Find XML document link
+      const xmlMatch = filingPage.match(
+        /href="([^"]+\.xml)"/i
       );
-      const pricePerShare = parseNumber(priceMatch ? priceMatch[1] : 0);
-      const totalValue = shares * pricePerShare;
+      if (!xmlMatch) continue;
 
-      transactions.push({
-        id: e.id || crypto.randomUUID(),
-        companyName,
-        ticker,
-        insiderName: cleanText(e.author?.name),
-        insiderTitle: "Insider",
-        shares,
-        pricePerShare,
-        totalValue,
-        transactionDate: e.updated,
-      });
+      const xmlUrl = `https://www.sec.gov${xmlMatch[1]}`;
+      const formXML = await fetchXML(xmlUrl);
+      const form = parser.parse(formXML);
+
+      const issuer = form?.ownershipDocument?.issuer;
+      const reportingOwner =
+        form?.ownershipDocument?.reportingOwner?.reportingOwnerId;
+
+      const transactions =
+        form?.ownershipDocument?.nonDerivativeTable?.nonDerivativeTransaction;
+
+      const txns = Array.isArray(transactions)
+        ? transactions
+        : transactions
+        ? [transactions]
+        : [];
+
+      for (const t of txns) {
+        if (t.transactionCoding?.transactionCode !== "P") continue;
+
+        const shares = Number(
+          t.transactionAmounts?.transactionShares?.value || 0
+        );
+        const price = Number(
+          t.transactionAmounts?.transactionPricePerShare?.value || 0
+        );
+
+        results.push({
+          id: entry.id,
+          companyName: issuer?.issuerName || "Unknown",
+          ticker: issuer?.issuerTradingSymbol || "UNKNOWN",
+          insiderName:
+            reportingOwner?.rptOwnerName || "Unknown",
+          insiderTitle: "Insider",
+          shares,
+          pricePerShare: price,
+          totalValue: shares * price,
+          transactionDate: entry.updated,
+        });
+      }
     }
 
-    // sort by largest dollar value
-    transactions.sort((a, b) => b.totalValue - a.totalValue);
-
-    res.status(200).json(transactions);
+    results.sort((a, b) => b.totalValue - a.totalValue);
+    res.status(200).json(results);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Failed to load insider buys" });
+    res.status(500).json({ error: "Failed to load Form 4 data" });
   }
 }
