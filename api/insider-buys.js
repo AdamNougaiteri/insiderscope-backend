@@ -17,13 +17,26 @@ globalThis.__INSIDER_CACHE__ = globalThis.__INSIDER_CACHE__ || {
 };
 const memCache = globalThis.__INSIDER_CACHE__;
 
-/** Strip XML namespace prefixes so <ns1:tag> becomes <tag> */
 function stripNamespaces(xml) {
   if (!xml) return "";
-  // remove xmlns="..." declarations (optional)
   let out = xml.replace(/\sxmlns(:\w+)?="[^"]*"/g, "");
-  // replace opening tags <ns:Tag ...> -> <Tag ...>
   out = out.replace(/<(\/*)\w+:(\w+)([^>]*)>/g, "<$1$2$3>");
+  return out;
+}
+
+function ensureArray(v) {
+  if (!v) return [];
+  return Array.isArray(v) ? v : [v];
+}
+
+function deepFindAll(obj, keyName, out = []) {
+  if (!obj || typeof obj !== "object") return out;
+  if (Object.prototype.hasOwnProperty.call(obj, keyName)) {
+    out.push(obj[keyName]);
+  }
+  for (const k of Object.keys(obj)) {
+    deepFindAll(obj[k], keyName, out);
+  }
   return out;
 }
 
@@ -66,7 +79,6 @@ function pickForm4Xml(indexJson) {
     .filter(Boolean)
     .filter((n) => n.toLowerCase().endsWith(".xml"));
 
-  // Prefer likely Form 4 doc names
   return (
     xmls.find((n) => n.toLowerCase().includes("form4")) ||
     xmls.find((n) => n.toLowerCase().includes("primary")) ||
@@ -88,81 +100,128 @@ function parseAtom(xml) {
   return entries;
 }
 
-// ---------- Regex-based Form 4 parsing (namespace-safe after stripNamespaces) ----------
-function firstTag(xml, tag) {
-  const re = new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i");
-  const m = xml.match(re);
-  return m ? safeText(m[1]) : "";
-}
-
-function firstNestedTag(xml, parentTag, childTag) {
-  const parentRe = new RegExp(
-    `<${parentTag}\\b[^>]*>([\\s\\S]*?)<\\/${parentTag}>`,
-    "i"
-  );
-  const pm = xml.match(parentRe);
-  if (!pm) return "";
-  const parentBody = pm[1];
-  return firstTag(parentBody, childTag);
-}
-
-function parseNumberTag(block, tag) {
-  const inner = firstTag(block, tag);
-  if (!inner) return null;
-  const v = firstTag(inner, "value") || inner;
+function numVal(v) {
+  if (v === null || v === undefined) return null;
+  if (typeof v === "number") return Number.isFinite(v) ? v : null;
   const n = Number(String(v).replace(/,/g, ""));
   return Number.isFinite(n) ? n : null;
 }
 
-function parseDateTag(block, tag) {
-  const inner = firstTag(block, tag);
-  if (!inner) return null;
-  const v = firstTag(inner, "value") || inner;
-  return isoDateOnly(v);
+function valueField(node) {
+  // Form4 often: { value: "123" }
+  if (node && typeof node === "object" && "value" in node) return node.value;
+  return node;
 }
 
-function parseForm4PurchasesRegex(xmlTextRaw) {
+function parseForm4Purchases(xmlTextRaw, debugCapture = null) {
   const xmlText = stripNamespaces(xmlTextRaw);
 
+  const parser = new XMLParser({
+    ignoreAttributes: false,
+    attributeNamePrefix: "",
+    // keep order off; standard object parse
+  });
+
+  let doc;
+  try {
+    doc = parser.parse(xmlText);
+  } catch (e) {
+    if (debugCapture) debugCapture.parseError = String(e);
+    return [];
+  }
+
+  // SEC Form 4 root commonly: ownershipDocument
+  const root = doc?.ownershipDocument || doc;
+
+  // issuer / owner
   const issuerTradingSymbol =
-    firstNestedTag(xmlText, "issuer", "issuerTradingSymbol") ||
-    firstTag(xmlText, "issuerTradingSymbol");
+    safeText(root?.issuer?.issuerTradingSymbol) ||
+    safeText(root?.issuerTradingSymbol) ||
+    safeText(root?.issuer?.tradingSymbol) ||
+    "";
 
   const issuerName =
-    firstNestedTag(xmlText, "issuer", "issuerName") ||
-    firstTag(xmlText, "issuerName");
+    safeText(root?.issuer?.issuerName) || safeText(root?.issuerName) || "";
 
-  const ownerName = firstTag(xmlText, "rptOwnerName") || firstTag(xmlText, "reportingOwnerName");
-  const officerTitle = firstTag(xmlText, "officerTitle");
+  const ownerName =
+    safeText(root?.reportingOwner?.reportingOwnerId?.rptOwnerName) ||
+    safeText(root?.rptOwnerName) ||
+    safeText(root?.reportingOwnerName) ||
+    "";
 
-  // nonDerivativeTransaction blocks (after stripping namespaces this matches)
-  const txBlocks = [];
-  const txRe = /<nonDerivativeTransaction\b[^>]*>([\s\S]*?)<\/nonDerivativeTransaction>/gi;
-  let m;
-  while ((m = txRe.exec(xmlText)) !== null) {
-    txBlocks.push(m[1]);
-    if (txBlocks.length > 400) break;
+  const officerTitle =
+    safeText(root?.reportingOwner?.reportingOwnerRelationship?.officerTitle) ||
+    safeText(root?.officerTitle) ||
+    "";
+
+  // Non-derivative transactions live here:
+  // ownershipDocument.nonDerivativeTable.nonDerivativeTransaction (array or object)
+  let txs =
+    root?.nonDerivativeTable?.nonDerivativeTransaction ??
+    root?.nonDerivativeTransaction ??
+    null;
+
+  txs = ensureArray(txs);
+
+  // If not found, do a deep search fallback (covers odd layouts)
+  if (txs.length === 0) {
+    const hits = deepFindAll(root, "nonDerivativeTransaction");
+    for (const h of hits) {
+      txs.push(...ensureArray(h));
+    }
+  }
+
+  // Debug: count codes seen
+  if (debugCapture) {
+    const codes = {};
+    for (const t of txs) {
+      const code = safeText(
+        valueField(t?.transactionCoding?.transactionCode) ??
+          t?.transactionCode ??
+          ""
+      );
+      if (code) codes[code] = (codes[code] || 0) + 1;
+    }
+    debugCapture.nonDerivCount = txs.length;
+    debugCapture.codes = codes;
   }
 
   const purchases = [];
-  for (const block of txBlocks) {
-    const code =
-      firstNestedTag(block, "transactionCoding", "transactionCode") ||
-      firstTag(block, "transactionCode");
 
-    if (safeText(code) !== "P") continue;
+  for (const t of txs) {
+    const code = safeText(
+      valueField(t?.transactionCoding?.transactionCode) ??
+        t?.transactionCode ??
+        ""
+    );
+    if (code !== "P") continue;
 
-    const shares = parseNumberTag(block, "transactionShares");
-    const price = parseNumberTag(block, "transactionPricePerShare");
-    const date = parseDateTag(block, "transactionDate");
+    const shares = numVal(
+      valueField(t?.transactionAmounts?.transactionShares) ??
+        valueField(t?.transactionShares) ??
+        null
+    );
+
+    const price = numVal(
+      valueField(t?.transactionAmounts?.transactionPricePerShare) ??
+        valueField(t?.transactionPricePerShare) ??
+        null
+    );
+
+    const date =
+      isoDateOnly(
+        valueField(t?.transactionDate) ??
+          valueField(t?.transactionDate?.value) ??
+          null
+      ) || null;
 
     if (!Number.isFinite(shares) || !Number.isFinite(price)) continue;
 
     purchases.push({
-      issuerTradingSymbol: issuerTradingSymbol || "",
-      issuerName: issuerName || "",
-      ownerName: ownerName || "",
-      officerTitle: officerTitle || "",
+      issuerTradingSymbol,
+      issuerName,
+      ownerName,
+      officerTitle,
       shares,
       pricePerShare: price,
       transactionDate: date,
@@ -172,7 +231,6 @@ function parseForm4PurchasesRegex(xmlTextRaw) {
 
   return purchases;
 }
-// --------------------------------------------------------
 
 export default async function handler(req, res) {
   res.setHeader("Content-Type", "application/json; charset=utf-8");
@@ -190,8 +248,9 @@ export default async function handler(req, res) {
   const days = clamp(toInt(req.query.days, 30), 1, 365);
   const scanCap = clamp(toInt(req.query.scan, 25), 1, 60);
   const debug = String(req.query.debug || "") === "1";
+  const v = safeText(req.query.v || ""); // cache buster
 
-  const cacheKey = `limit=${limit}|days=${days}|scan=${scanCap}`;
+  const cacheKey = `limit=${limit}|days=${days}|scan=${scanCap}|v=${v}`;
   const now = Date.now();
   const cacheTtlMs = 5 * 60 * 1000;
 
@@ -216,25 +275,9 @@ export default async function handler(req, res) {
   try {
     const atomResp = await fetch(atomUrl, { headers });
     if (atomResp.status === 429) {
-      if (memCache.data) {
-        return res.status(200).json(
-          debug
-            ? {
-                data: memCache.data,
-                debug: {
-                  cache: "mem-stale-after-429",
-                  limit,
-                  days,
-                  scanCap,
-                  atomStatus: 429,
-                },
-              }
-            : memCache.data
-        );
-      }
       return res.status(429).json({
         error: "SEC Atom fetch failed (429)",
-        hint: "SEC rate limited the backend. Reduce refreshes.",
+        hint: "SEC rate limited the backend.",
       });
     }
     if (!atomResp.ok) {
@@ -275,10 +318,6 @@ export default async function handler(req, res) {
       const idxUrl = indexJsonUrl(meta.cik, meta.accessionNoNoDash);
       const idxResp = await fetch(idxUrl, { headers });
 
-      if (idxResp.status === 429) {
-        errorsSample.push({ where: "index.json", status: 429, idxUrl });
-        break;
-      }
       if (!idxResp.ok) {
         errorsSample.push({ where: "index.json", status: idxResp.status, idxUrl });
         continue;
@@ -295,27 +334,23 @@ export default async function handler(req, res) {
       await sleep(250);
 
       const xmlResp = await fetch(xmlUrl, { headers });
-      if (xmlResp.status === 429) {
-        errorsSample.push({ where: "form4.xml", status: 429, xmlUrl });
-        break;
-      }
       if (!xmlResp.ok) {
         errorsSample.push({ where: "form4.xml", status: xmlResp.status, xmlUrl });
         continue;
       }
 
       const xmlText = await xmlResp.text();
-      const purchases = parseForm4PurchasesRegex(xmlText);
 
-      if (debug && samples.length < 10) {
-        const norm = stripNamespaces(xmlText);
+      const dbg = debug ? {} : null;
+      const purchases = parseForm4Purchases(xmlText, dbg);
+
+      if (debug && samples.length < 12) {
         samples.push({
           idxUrl,
           xmlUrl,
           xmlName,
           purchasesFound: purchases.length,
-          issuerTradingSymbol: firstTag(norm, "issuerTradingSymbol"),
-          rptOwnerName: firstTag(norm, "rptOwnerName"),
+          ...(dbg || {}),
         });
       }
 
@@ -323,7 +358,7 @@ export default async function handler(req, res) {
         const dt = p.transactionDate || isoDateOnly(updated);
         const sym = p.issuerTradingSymbol || "—";
         const nm = p.ownerName || "—";
-        const id = `${nm}-${sym}-${dt}`;
+        const id = `${nm}-${sym}-${dt}-${Math.random().toString(16).slice(2)}`;
 
         out.push({
           id,
@@ -337,7 +372,7 @@ export default async function handler(req, res) {
           pricePerShare: p.pricePerShare,
           totalValue: p.totalValue,
           transactionDate: dt,
-          signalScore: 50, // placeholder
+          signalScore: 50,
           purchaseType: "own-company",
         });
 
