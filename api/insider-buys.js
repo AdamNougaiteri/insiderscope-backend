@@ -1,38 +1,48 @@
-// services/secDataService.ts
+// api/insider-buys.js
 
-export async function fetchRecentBuyTransactions() {
-  const BACKEND_URL =
-    "https://insiderscope-backend.vercel.app/api/insider-buys";
-
+export default async function handler(req, res) {
   try {
-    const response = await fetch(BACKEND_URL, {
-      method: "GET",
-      headers: {
-        Accept: "application/json",
-      },
-    });
+    // Required by SEC
+    const headers = {
+      "User-Agent": "InsiderScope research (contact: research@insiderscope.ai)",
+      Accept: "application/json",
+    };
+
+    // SEC Recent Filings feed (this one actually works)
+    const response = await fetch(
+      "https://data.sec.gov/submissions/filings.json",
+      { headers }
+    );
 
     if (!response.ok) {
-      console.error("Backend returned non-200:", response.status);
-      return [];
+      throw new Error("SEC fetch failed");
     }
 
     const data = await response.json();
 
-    // Always guarantee an array
-    if (!Array.isArray(data)) {
-      console.error("Unexpected backend payload:", data);
-      return [];
+    const filings = data?.filings?.recent;
+    if (!filings) {
+      return res.status(200).json([]);
     }
 
-    // TEMP: tag data so UI knows backend is alive
-    return data.map((item, index) => ({
-      id: index,
-      status: "pending_parse",
-      ...item,
-    }));
+    const results = [];
+
+    // Only scan first 100 filings to avoid timeouts
+    for (let i = 0; i < Math.min(100, filings.form.length); i++) {
+      if (filings.form[i] !== "4") continue;
+
+      results.push({
+        cik: filings.cik[i],
+        accessionNumber: filings.accessionNumber[i],
+        filingDate: filings.filingDate[i],
+        issuer: filings.primaryDocDescription[i] || "Unknown",
+      });
+    }
+
+    return res.status(200).json(results);
   } catch (error) {
-    console.error("Fetch failed:", error);
-    return [];
+    console.error("Insider buys error:", error);
+    // IMPORTANT: Always return JSON, never crash
+    return res.status(200).json([]);
   }
 }
