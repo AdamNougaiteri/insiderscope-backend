@@ -1,42 +1,25 @@
 // api/insider-buys.js
+import { fetchRecentInsiderBuys } from "../lib/secDataServices.js";
 
-export default function handler(req, res) {
-  return res.status(200).json([
-    {
-      cik: "0000320193",
-      ticker: "AAPL",
-      company: "Apple Inc.",
-      insider: "Timothy D. Cook",
-      role: "CEO",
-      shares: 50000,
-      price: 189.42,
-      value: 9471000,
-      filingDate: "2025-12-22",
-      signalScore: 92
-    },
-    {
-      cik: "0000789019",
-      ticker: "MSFT",
-      company: "Microsoft Corp.",
-      insider: "Satya Nadella",
-      role: "CEO",
-      shares: 25000,
-      price: 412.15,
-      value: 10303750,
-      filingDate: "2025-12-21",
-      signalScore: 88
-    },
-    {
-      cik: "0001318605",
-      ticker: "TSLA",
-      company: "Tesla Inc.",
-      insider: "Kimbal Musk",
-      role: "Director",
-      shares: 100000,
-      price: 248.31,
-      value: 24831000,
-      filingDate: "2025-12-20",
-      signalScore: 81
-    }
-  ]);
+export default async function handler(req, res) {
+  try {
+    // Query params (all optional)
+    // /api/insider-buys?limit=25&minValue=100000&affiliation=Officer
+    const limit = Number(req.query.limit ?? 25);
+    const minValue = Number(req.query.minValue ?? 0);
+    const affiliation = String(req.query.affiliation ?? "any"); // any | Officer | Director | 10% Owner | Other
+
+    const data = await fetchRecentInsiderBuys({
+      limit: Number.isFinite(limit) ? Math.max(1, Math.min(100, limit)) : 25,
+      minValue: Number.isFinite(minValue) ? Math.max(0, minValue) : 0,
+      affiliation,
+    });
+
+    return res.status(200).json(data);
+  } catch (err) {
+    return res.status(500).json({
+      error: "INTERNAL_SERVER_ERROR",
+      message: err?.message ?? String(err),
+    });
+  }
 }
