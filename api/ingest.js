@@ -15,104 +15,22 @@ globalThis.__INSIDERSCOPE_POOL__ = pool;
 function nowIso() {
   return new Date().toISOString();
 }
-
 function num(v, def) {
   const n = Number(v);
   return Number.isFinite(n) ? n : def;
 }
-
 function bool(v, def = false) {
   if (v === undefined || v === null) return def;
   const s = String(v).toLowerCase();
   return s === "1" || s === "true" || s === "yes" || s === "on";
 }
-
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
-
 function getBaseUrl(req) {
   const proto = (req.headers["x-forwarded-proto"] || "https").toString();
   const host = (req.headers["x-forwarded-host"] || req.headers.host).toString();
   return `${proto}://${host}`;
-}
-
-async function ensureSchema(client) {
-  // --- Companies
-  await client.query(`
-    CREATE TABLE IF NOT EXISTS companies (
-      cik TEXT PRIMARY KEY,
-      ticker TEXT,
-      company_name TEXT,
-      created_at TIMESTAMPTZ DEFAULT now(),
-      updated_at TIMESTAMPTZ DEFAULT now()
-    );
-  `);
-
-  // Add missing columns safely if table already exists with a different shape
-  await client.query(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS ticker TEXT;`);
-  await client.query(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS company_name TEXT;`);
-  await client.query(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();`);
-  await client.query(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();`);
-
-  // --- Insider transactions
-  await client.query(`
-    CREATE TABLE IF NOT EXISTS insider_transactions (
-      id TEXT PRIMARY KEY
-    );
-  `);
-
-  // Ensure required columns exist
-  const alterTx = [
-    `ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS cik TEXT;`,
-    `ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS employer_ticker TEXT;`,
-    `ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS employer_company TEXT;`,
-    `ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS purchased_ticker TEXT;`,
-    `ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS purchased_company TEXT;`,
-    `ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS insider_name TEXT;`,
-    `ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS insider_title TEXT;`,
-    `ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS shares NUMERIC;`,
-    `ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS price_per_share NUMERIC;`,
-    `ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS total_value NUMERIC;`,
-    `ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS transaction_date DATE;`,
-    `ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS signal_score NUMERIC;`,
-    `ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS purchase_type TEXT;`,
-    `ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS raw JSONB;`,
-    `ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();`,
-    `ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();`,
-  ];
-  for (const q of alterTx) await client.query(q);
-
-  // Indexes
-  await client.query(`
-    CREATE INDEX IF NOT EXISTS idx_insider_tx_purchased_ticker_date
-    ON insider_transactions(purchased_ticker, transaction_date DESC);
-  `);
-
-  await client.query(`
-    CREATE INDEX IF NOT EXISTS idx_insider_tx_insider_date
-    ON insider_transactions(insider_name, transaction_date DESC);
-  `);
-
-  // --- Ingestion state (match what your /api/migrate shows: id + value)
-  await client.query(`
-    CREATE TABLE IF NOT EXISTS ingestion_state (
-      id TEXT PRIMARY KEY,
-      value JSONB,
-      updated_at TIMESTAMPTZ DEFAULT now()
-    );
-  `);
-
-  // If Neon integration created a fancier ingestion_state, these will just no-op if already present
-  await client.query(`ALTER TABLE ingestion_state ADD COLUMN IF NOT EXISTS id TEXT;`);
-  await client.query(`ALTER TABLE ingestion_state ADD COLUMN IF NOT EXISTS value JSONB;`);
-  await client.query(`ALTER TABLE ingestion_state ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();`);
-
-  // Ensure primary key on id (safe-ish)
-  // If a PK already exists, this may throw; so wrap it.
-  try {
-    await client.query(`ALTER TABLE ingestion_state ADD CONSTRAINT ingestion_state_pkey PRIMARY KEY (id);`);
-  } catch {}
 }
 
 async function getState(client, id) {
@@ -160,7 +78,7 @@ async function statusResponse(client) {
 
 async function fetchInsiderBuysFromSelf(
   req,
-  { pageSize, page, days, mode, includeGroups } = {}
+  { pageSize, page, days, mode, includeGroups, debug } = {}
 ) {
   const base = getBaseUrl(req);
   const url =
@@ -169,12 +87,13 @@ async function fetchInsiderBuysFromSelf(
     `&page=${encodeURIComponent(page)}` +
     `&days=${encodeURIComponent(days)}` +
     (mode === "seed" ? `&mode=seed` : ``) +
-    (includeGroups ? `&includeGroups=1` : ``);
+    (includeGroups ? `&includeGroups=1` : ``) +
+    (debug ? `&debug=1` : ``);
 
   const r = await fetch(url, { method: "GET", headers: { Accept: "application/json" } });
   if (!r.ok) {
     const txt = await r.text().catch(() => "");
-    throw new Error(`insider-buys HTTP ${r.status} ${txt}`.slice(0, 800));
+    throw new Error(`insider-buys HTTP ${r.status} ${txt}`.slice(0, 500));
   }
 
   const payload = await r.json();
@@ -185,19 +104,24 @@ async function fetchInsiderBuysFromSelf(
 }
 
 async function upsertBatch(client, rows) {
-  let upserts = 0;
+  let inserted = 0;
 
   for (const item of rows) {
-    const id = String(item.id ?? "");
-    if (!id) continue;
+    const purchasedTicker = item.purchasedTicker ? String(item.purchasedTicker) : "";
+    const employerTicker = item.employerTicker ? String(item.employerTicker) : "";
+    const insiderName = String(item.insiderName ?? "");
+    const insiderTitle = String(item.insiderTitle ?? "");
+    const transactionDate = String(item.transactionDate ?? "");
+    const shares = Number(item.shares ?? 0);
+    const pricePerShare = Number(item.pricePerShare ?? 0);
 
-    const purchasedTicker = item.purchasedTicker ? String(item.purchasedTicker) : null;
-    const purchasedCompany = item.purchasedCompany ? String(item.purchasedCompany) : null;
-    const employerTicker = item.employerTicker ? String(item.employerTicker) : null;
-    const employerCompany = item.employerCompany ? String(item.employerCompany) : null;
-
-    // Note: your current insider-buys payload might not include cik — that's okay
-    const cik = item.cik ? String(item.cik) : null;
+    // Deterministic id (matches migrate.js backfill)
+    const idSeed = `${purchasedTicker}|${employerTicker}|${insiderName}|${insiderTitle}|${transactionDate}|${shares}|${pricePerShare}`;
+    const id = await (async () => {
+      // compute md5 in Postgres so it matches DB behavior
+      const r = await client.query(`SELECT md5($1) AS id`, [idSeed]);
+      return r.rows?.[0]?.id;
+    })();
 
     await client.query(
       `
@@ -237,49 +161,33 @@ async function upsertBatch(client, rows) {
       `,
       [
         id,
-        cik,
-        employerTicker,
-        employerCompany,
-        purchasedTicker,
-        purchasedCompany,
-        String(item.insiderName ?? ""),
-        String(item.insiderTitle ?? ""),
-        Number(item.shares ?? 0),
-        Number(item.pricePerShare ?? 0),
+        item.cik ? String(item.cik) : null,
+        item.employerTicker ? String(item.employerTicker) : null,
+        item.employerCompany ? String(item.employerCompany) : null,
+        item.purchasedTicker ? String(item.purchasedTicker) : null,
+        item.purchasedCompany ? String(item.purchasedCompany) : null,
+        insiderName,
+        insiderTitle,
+        shares,
+        pricePerShare,
         Number(item.totalValue ?? 0),
-        String(item.transactionDate ?? ""),
+        transactionDate,
         Number(item.signalScore ?? 0),
         String(item.purchaseType ?? ""),
         JSON.stringify(item),
       ]
     );
 
-    // Upsert companies best-effort if cik exists
-    if (cik) {
-      await client.query(
-        `
-        INSERT INTO companies(cik, ticker, company_name, updated_at)
-        VALUES($1,$2,$3, now())
-        ON CONFLICT (cik) DO UPDATE SET
-          ticker = COALESCE(EXCLUDED.ticker, companies.ticker),
-          company_name = COALESCE(EXCLUDED.company_name, companies.company_name),
-          updated_at = now()
-        `,
-        [cik, purchasedTicker || employerTicker, purchasedCompany || employerCompany]
-      );
-    }
-
-    upserts += 1;
+    inserted += 1;
   }
 
-  return upserts;
+  return inserted;
 }
 
 export default async function handler(req, res) {
   if (req.method !== "GET" && req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" });
   }
-
   if (!process.env.DATABASE_URL) {
     return res.status(500).json({ error: "DATABASE_URL missing" });
   }
@@ -289,17 +197,14 @@ export default async function handler(req, res) {
 
   const pageSize = num(req.query.pageSize, 50);
   const maxPages = num(req.query.maxPages, 3);
-  const throttleMs = num(req.query.throttleMs, 600);
+  const throttleMs = num(req.query.throttleMs, 700);
   const days = num(req.query.days, 30);
-
   const dataMode = String(req.query.dataMode || "live"); // live | seed
   const includeGroups = bool(req.query.includeGroups, true);
 
   const client = await pool.connect();
 
   try {
-    await ensureSchema(client);
-
     if (mode === "status") {
       return res.status(200).json(await statusResponse(client));
     }
@@ -308,15 +213,14 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "Unknown mode", allowed: ["status", "run", "backfill"] });
     }
 
-    const cursorId = mode === "backfill" ? "insider_buys_backfill_cursor" : "insider_buys_cursor";
-    const existingCursor = (await getState(client, cursorId)) || {};
-    const startPage = num(req.query.page, existingCursor.page || 1);
+    const cursorKey = mode === "run" ? "insider_buys_cursor" : "insider_buys_backfill_cursor";
+    const existing = (await getState(client, cursorKey)) || {};
+    const startPage = num(req.query.page, existing.page || 1);
 
     let page = startPage;
-    let fetched = 0;
-    let inserted = 0;
+    let totalFetched = 0;
+    let totalInserted = 0;
     let lastUrl = null;
-
     const startedAt = Date.now();
 
     for (let i = 0; i < maxPages; i++) {
@@ -326,17 +230,17 @@ export default async function handler(req, res) {
         days,
         mode: dataMode,
         includeGroups,
+        debug: false,
       });
 
       lastUrl = url;
-      fetched += data.length;
+      totalFetched += data.length;
 
       if (!dryRun && data.length) {
-        inserted += await upsertBatch(client, data);
+        totalInserted += await upsertBatch(client, data);
       }
 
-      // cursor advance
-      await setState(client, cursorId, {
+      await setState(client, cursorKey, {
         page: page + 1,
         pageSize,
         days,
@@ -346,31 +250,24 @@ export default async function handler(req, res) {
       });
 
       if (data.length === 0) break;
-
       page += 1;
-      if (throttleMs > 0) await sleep(throttleMs);
 
-      // stay under typical serverless execution time
-      if (Date.now() - startedAt > 22_000) break;
+      if (throttleMs > 0) await sleep(throttleMs);
+      if (Date.now() - startedAt > 22_000) break; // serverless guardrail
     }
 
     const out = {
       ok: true,
       mode,
       dryRun,
-      fetched,
-      inserted,
-      cursor: await getState(client, cursorId),
+      fetched: totalFetched,
+      inserted: totalInserted,
+      cursor: await getState(client, cursorKey),
       lastUrl,
       ts: nowIso(),
-      hint:
-        mode === "backfill"
-          ? "Call backfill repeatedly (same URL) until fetched stops increasing / pages return 0 rows."
-          : "Run is incremental. Call periodically to keep DB fresh.",
     };
 
-    await setState(client, "ingest_last_run", { ...out, finishedAt: nowIso() });
-
+    await setState(client, "ingest_last_run", out);
     return res.status(200).json(out);
   } catch (err) {
     const msg = err?.message || String(err);
