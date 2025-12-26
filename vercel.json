@@ -10,6 +10,9 @@
     }
   ],
   "crons": [
-    { "path": "/api/cron-refresh", "schedule": "0 9 * * *" }
+    {
+      "path": "/api/cron-refresh",
+      "schedule": "15 6 * * *"
+    }
   ]
 }
