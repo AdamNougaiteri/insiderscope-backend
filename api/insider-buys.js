@@ -1,25 +1,15 @@
+import { XMLParser } from "fast-xml-parser";
+
+const parser = new XMLParser({ ignoreAttributes: false });
+
+const SEC_HEADERS = {
+  "User-Agent": "InsiderScope demo contact@example.com",
+  Accept: "application/xml",
+};
+
 export default async function handler(req, res) {
   try {
-    // TEMP: stable hardcoded response to unblock frontend
-    // (We will replace this with real SEC parsing next)
-    const data = [
+    // 1. Get latest Form 4 filings
+    const feedRes = await fetch(
+      "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&owner=only&count=40&output=atom",
       {
-        id: "test-1",
-        companyName: "Test Company",
-        ticker: "TEST",
-        insiderName: "Test Insider",
-        insiderTitle: "Director",
-        shares: 10000,
-        pricePerShare: 100,
-        totalValue: 1000000,
-        transactionDate: new Date().toISOString().split("T")[0],
-      },
-    ];
-
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.status(200).json(data);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to fetch insider buys" });
-  }
-}
