@@ -13,24 +13,30 @@ export default async function handler(req, res) {
 
     const feedText = await feedRes.text();
 
-    // 2. Extract ALL filing URLs
-    const filingLinks = [
-      ...feedText.matchAll(
-        /href="(https:\/\/www\.sec\.gov\/Archives\/edgar\/data\/\d+\/[0-9-]+-index\.html)"/g
-      ),
-    ].map(m => m[1]);
+    // 2. Extract accession numbers DIRECTLY (this always works)
+    const accessionMatches = [
+      ...feedText.matchAll(/<accession-number>(.*?)<\/accession-number>/g),
+    ];
+
+    const accessions = accessionMatches.map(m => m[1]);
 
     const results = [];
     const debug = [];
 
-    // 3. Iterate filings
-    for (const link of filingLinks) {
-      const parts = link.match(/data\/(\d+)\/([0-9-]+)-index\.html/);
-      if (!parts) continue;
-
-      const cik = parts[1].padStart(10, "0");
-      const accession = parts[2];
+    // 3. Iterate accessions
+    for (const accession of accessions) {
       const accessionNoDash = accession.replace(/-/g, "");
+
+      // CIK is not in accession, extract from feed context
+      const cikMatch = feedText.match(
+        new RegExp(
+          `<accession-number>${accession}<\\/accession-number>[\\s\\S]*?<cik>(\\d+)<\\/cik>`
+        )
+      );
+
+      if (!cikMatch) continue;
+
+      const cik = cikMatch[1].padStart(10, "0");
 
       try {
         const xmlUrl = `https://www.sec.gov/Archives/edgar/data/${cik}/${accessionNoDash}/xslF345X03/primary_doc.xml`;
@@ -45,27 +51,35 @@ export default async function handler(req, res) {
 
         const transactionCode =
           xml.match(/<transactionCode>(.*?)<\/transactionCode>/)?.[1] || null;
+
         const shares =
-          Number(xml.match(/<transactionShares>.*?<value>(.*?)<\/value>/s)?.[1] || 0);
+          Number(
+            xml.match(/<transactionShares>[\s\S]*?<value>(.*?)<\/value>/)?.[1] || 0
+          );
+
         const price =
-          Number(xml.match(/<transactionPricePerShare>.*?<value>(.*?)<\/value>/s)?.[1] || 0);
+          Number(
+            xml.match(/<transactionPricePerShare>[\s\S]*?<value>(.*?)<\/value>/)?.[1] || 0
+          );
 
         const company =
           xml.match(/<issuerName>(.*?)<\/issuerName>/)?.[1] || "Unknown";
+
         const insider =
           xml.match(/<rptOwnerName>(.*?)<\/rptOwnerName>/)?.[1] || "Unknown";
 
         debug.push({
           accession,
           cik,
-          company,
-          insider,
           transactionCode,
           shares,
           price,
+          company,
+          insider,
         });
 
-        if (transactionCode === "P" && shares > 0) {
+        // Only true open-market purchases
+        if (transactionCode === "P" && shares > 0 && price > 0) {
           results.push({
             id: accession,
             companyName: company,
@@ -84,7 +98,7 @@ export default async function handler(req, res) {
     }
 
     return res.status(200).json({
-      accessionCount: filingLinks.length,
+      accessionCount: accessions.length,
       inspected: debug.length,
       count: results.length,
       results,
