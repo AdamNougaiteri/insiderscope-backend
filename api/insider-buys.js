@@ -1,57 +1,78 @@
+// /api/insider-buys.js
+// REAL Form 4 insider BUY parser (Phase A1)
+
 export default async function handler(req, res) {
   try {
-    const LOOKBACK_DAYS = 7; // change to 365 later
+    const LOOKBACK_DAYS = 7;
+    const now = new Date();
+    const cutoff = new Date(now.getTime() - LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
 
-    const today = new Date();
-    const filings = [];
+    // Step 1: Get recent Form 4 filings
+    const submissionsUrl =
+      "https://data.sec.gov/submissions/CIK0000320193.json"; // Apple as seed (SEC allows this)
 
-    for (let i = 0; i < LOOKBACK_DAYS; i++) {
-      const d = new Date(today);
-      d.setDate(today.getDate() - i);
+    const submissionsRes = await fetch(submissionsUrl, {
+      headers: {
+        "User-Agent": "InsiderScope (contact: you@example.com)",
+        Accept: "application/json",
+      },
+    });
 
-      const year = d.getFullYear();
-      const quarter = `QTR${Math.floor(d.getMonth() / 3) + 1}`;
-      const yyyymmdd = d.toISOString().slice(0, 10).replace(/-/g, "");
+    const submissions = await submissionsRes.json();
+    const recent = submissions.filings.recent;
 
-      const indexUrl = `https://www.sec.gov/Archives/edgar/daily-index/${year}/${quarter}/form.${yyyymmdd}.idx`;
+    const results = [];
 
-      const idxRes = await fetch(indexUrl, {
+    for (let i = 0; i < recent.accessionNumber.length; i++) {
+      if (recent.form[i] !== "4") continue;
+
+      const filingDate = new Date(recent.filingDate[i]);
+      if (filingDate < cutoff) continue;
+
+      const accession = recent.accessionNumber[i].replace(/-/g, "");
+      const cik = submissions.cik;
+      const xmlUrl = `https://www.sec.gov/Archives/edgar/data/${cik}/${accession}/xslF345X03/primary_doc.xml`;
+
+      const xmlRes = await fetch(xmlUrl, {
         headers: {
-          "User-Agent": "InsiderScope dev (contact: you@example.com)",
+          "User-Agent": "InsiderScope (contact: you@example.com)",
+          Accept: "application/xml",
         },
       });
 
-      if (!idxRes.ok) continue;
+      if (!xmlRes.ok) continue;
 
-      const text = await idxRes.text();
-      const lines = text.split("\n");
+      const xml = await xmlRes.text();
 
-      for (const line of lines) {
-        if (line.includes("|4|")) {
-          const parts = line.split("|");
-          filings.push({
-            cik: parts[0],
-            companyName: parts[1],
-            form: parts[2],
-            filingDate: parts[3],
-            path: `https://www.sec.gov/Archives/${parts[4]}`,
-          });
-        }
-      }
+      // Step 2: Only BUY transactions (P)
+      if (!xml.includes("<transactionCode>P</transactionCode>")) continue;
+
+      const get = (tag) => {
+        const match = xml.match(new RegExp(`<${tag}>(.*?)</${tag}>`));
+        return match ? match[1] : null;
+      };
+
+      const shares = parseFloat(get("transactionShares")) || 0;
+      const price = parseFloat(get("transactionPricePerShare")) || 0;
+
+      results.push({
+        id: accession,
+        companyName: get("issuerName") || "Unknown",
+        ticker: get("issuerTradingSymbol") || "—",
+        insiderName: get("rptOwnerName") || "Unknown",
+        insiderTitle: get("officerTitle") || "Insider",
+        shares,
+        pricePerShare: price,
+        totalValue: shares * price,
+        transactionDate: get("transactionDate") || recent.filingDate[i],
+      });
     }
 
-    res.status(200).json({
-      ok: true,
-      lookbackDays: LOOKBACK_DAYS,
-      filingsFound: filings.length,
-      filings: filings.slice(0, 50),
-      note: "Global Form 4 filings (Phase 1, no transaction parsing yet)",
-    });
-
+    res.status(200).json(results);
   } catch (err) {
     res.status(500).json({
-      ok: false,
-      error: err.message,
+      error: "Failed to fetch Form 4 data",
+      message: err.message,
     });
   }
 }
