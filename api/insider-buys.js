@@ -1,266 +1,381 @@
-// api/insider-buys.js
+// /api/insider-buys.js
+// Cached + throttled SEC Atom fetcher for insider buys (Form 4).
+// Works on Vercel Serverless. Uses in-memory cache (best-effort) + Vercel edge caching.
 
-const BASE_ATOM =
-  "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&owner=only&count=100&output=atom";
+import { XMLParser } from "fast-xml-parser";
 
-const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
-const REQUEST_DELAY_MS = 350;
+// --- tiny utils ---
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-let cache = { ts: 0, key: "", data: [], debug: {} };
-
-function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
-function clampInt(v, def, min, max) {
+function toInt(v, d) {
   const n = Number(v);
-  if (!Number.isFinite(n)) return def;
-  return Math.max(min, Math.min(max, Math.floor(n)));
-}
-function daysAgoIso(days) {
-  const d = new Date();
-  d.setUTCDate(d.getUTCDate() - days);
-  return d.toISOString();
-}
-async function fetchText(url, headers) {
-  await sleep(REQUEST_DELAY_MS);
-  const r = await fetch(url, { headers });
-  const t = await r.text();
-  return { ok: r.ok, status: r.status, text: t };
+  return Number.isFinite(n) ? n : d;
 }
 
-function extractTag(xml, tag) {
-  const re = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i");
-  const m = xml.match(re);
-  return m ? m[1].trim() : null;
-}
-function extractTagValue(xml, tag) {
-  const inner = extractTag(xml, tag);
-  if (!inner) return null;
-  const v = extractTag(inner, "value");
-  if (v) return v.trim();
-  return inner.replace(/<[^>]+>/g, "").trim() || null;
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
 }
 
-function extractAllEntries(atomXml) {
-  const entries = [];
-  const re = /<entry>([\s\S]*?)<\/entry>/gi;
-  let m;
-  while ((m = re.exec(atomXml))) entries.push(m[1]);
+function isoDateOnly(s) {
+  if (!s) return null;
+  // Handles "2025-12-22T..." or "2025-12-22"
+  return String(s).slice(0, 10);
+}
+
+function safeText(v) {
+  if (v === null || v === undefined) return "";
+  return String(v).trim();
+}
+
+function parseAtom(xml) {
+  const parser = new XMLParser({
+    ignoreAttributes: false,
+    attributeNamePrefix: "",
+  });
+  const doc = parser.parse(xml);
+  const feed = doc?.feed;
+  let entries = feed?.entry || [];
+  if (!Array.isArray(entries)) entries = [entries].filter(Boolean);
   return entries;
 }
-function extractLinksFromEntry(entryXml) {
-  const hrefs = [];
-  const re = /href="([^"]+)"/gi;
-  let m;
-  while ((m = re.exec(entryXml))) hrefs.push(m[1]);
-  return hrefs;
-}
-function pickFilingIndexHtmlLink(hrefs) {
-  const idx = hrefs.find((h) => /-index\.html$/i.test(h));
-  return idx || hrefs[0] || null;
-}
-async function fetchFilingIndexHtml(indexUrl, headers) {
-  const { ok, status, text } = await fetchText(indexUrl, headers);
-  if (!ok) throw new Error(`SEC index fetch failed ${status}`);
-  return text;
-}
-function findXmlPrimaryDoc(indexHtml) {
-  const re = /href="([^"]+\.xml)"/gi;
-  let m;
-  while ((m = re.exec(indexHtml))) {
-    const href = m[1];
-    if (/\.xml$/i.test(href)) return href;
-  }
-  return null;
-}
-async function fetchForm4Xml(indexUrl, indexHtml, headers) {
-  let xmlHref = findXmlPrimaryDoc(indexHtml);
-  if (!xmlHref) return null;
 
-  if (xmlHref.startsWith("/")) xmlHref = `https://www.sec.gov${xmlHref}`;
-  else if (!xmlHref.startsWith("http")) {
-    const base = new URL(indexUrl);
-    xmlHref = `${base.origin}${xmlHref.startsWith("/") ? "" : "/"}${xmlHref}`;
-  }
-
-  const { ok, status, text } = await fetchText(xmlHref, headers);
-  if (!ok) throw new Error(`SEC XML fetch failed ${status}`);
-  return text;
+// Extract accession number + CIK from an SEC archive URL
+// Example: https://www.sec.gov/Archives/edgar/data/320193/000032019325000123/...
+function extractCikAndAccession(url) {
+  const u = safeText(url);
+  const m = u.match(/edgar\/data\/(\d+)\/(\d{18,})/i);
+  if (!m) return null;
+  const cik = m[1];
+  const accessionNoRaw = m[2];
+  // Convert 000032019325000123 -> 0000320193-25-000123 (SEC format)
+  const accessionNo =
+    accessionNoRaw.length === 18
+      ? `${accessionNoRaw.slice(0, 10)}-${accessionNoRaw.slice(
+          10,
+          12
+        )}-${accessionNoRaw.slice(12)}`
+      : accessionNoRaw;
+  return { cik, accessionNo };
 }
 
-function parseTransactionsFromForm4Xml(form4Xml) {
-  const txs = [];
-  const re = /<nonDerivativeTransaction>([\s\S]*?)<\/nonDerivativeTransaction>/gi;
-  let m;
-  while ((m = re.exec(form4Xml))) {
-    const block = m[1];
-    const code = extractTagValue(block, "transactionCode");
-    if (String(code || "").toUpperCase() !== "P") continue;
-
-    const sharesStr = extractTagValue(block, "transactionShares");
-    const priceStr = extractTagValue(block, "transactionPricePerShare");
-    const dateStr = extractTagValue(block, "transactionDate");
-
-    const shares = sharesStr ? Number(String(sharesStr).replace(/,/g, "")) : null;
-    const pricePerShare = priceStr ? Number(String(priceStr).replace(/,/g, "")) : null;
-
-    txs.push({
-      shares: Number.isFinite(shares) ? shares : null,
-      pricePerShare: Number.isFinite(pricePerShare) ? pricePerShare : null,
-      transactionDate: dateStr ? String(dateStr).trim() : null,
-    });
-  }
-  return txs;
+// Build SEC "index.json" URL for filing directory
+function indexJsonUrl(cik, accessionNoRawOrDashed) {
+  const dashed = accessionNoRawOrDashed.includes("-")
+    ? accessionNoRawOrDashed
+    : accessionNoRawOrDashed;
+  const nodash = dashed.replace(/-/g, "");
+  return `https://data.sec.gov/Archives/edgar/data/${Number(
+    cik
+  )}/${nodash}/index.json`;
 }
 
-function computeSignalScore(totalValue, role) {
-  let score = 50;
-  if (typeof totalValue === "number") {
-    if (totalValue >= 5_000_000) score += 35;
-    else if (totalValue >= 1_000_000) score += 25;
-    else if (totalValue >= 250_000) score += 15;
-    else if (totalValue >= 50_000) score += 5;
-  }
-  const r = String(role || "").toLowerCase();
-  if (r.includes("chief executive") || r === "ceo") score += 10;
-  if (r.includes("chief financial") || r === "cfo") score += 6;
-  if (r.includes("director")) score += 3;
-  return Math.max(1, Math.min(99, Math.round(score)));
+// Find likely Form 4 XML file inside index.json listing
+function pickForm4Xml(indexJson) {
+  const files = indexJson?.directory?.item || [];
+  const arr = Array.isArray(files) ? files : [files].filter(Boolean);
+
+  // Prefer something that looks like "form4.xml" or contains "primary_doc.xml"
+  const candidates = arr
+    .map((f) => safeText(f?.name))
+    .filter(Boolean)
+    .filter((name) => name.toLowerCase().endsWith(".xml"));
+
+  const preferred =
+    candidates.find((n) => n.toLowerCase().includes("form4")) ||
+    candidates.find((n) => n.toLowerCase().includes("primary")) ||
+    candidates[0];
+
+  return preferred || null;
 }
 
+// Minimal parse: pull issuer, reporting owner, and NON-derivative purchases ("P")
+function parseForm4Xml(xmlText) {
+  const parser = new XMLParser({
+    ignoreAttributes: false,
+    attributeNamePrefix: "",
+  });
+  const doc = parser.parse(xmlText);
+
+  // XML shapes vary; be defensive.
+  const ownershipDocument =
+    doc?.ownershipDocument || doc?.document || doc || {};
+
+  const issuer = ownershipDocument?.issuer || {};
+  const reportingOwner = ownershipDocument?.reportingOwner || {};
+
+  // reportingOwner can be array
+  const ro = Array.isArray(reportingOwner)
+    ? reportingOwner[0]
+    : reportingOwner || {};
+
+  const issuerTradingSymbol = safeText(issuer?.issuerTradingSymbol);
+  const issuerName = safeText(issuer?.issuerName);
+
+  const ownerName = safeText(
+    ro?.reportingOwnerId?.rptOwnerName || ro?.rptOwnerName
+  );
+  const ownerTitle = safeText(
+    ro?.reportingOwnerRelationship?.officerTitle ||
+      ro?.officerTitle ||
+      ro?.reportingOwnerRelationship?.otherText
+  );
+
+  const nonDerivTable =
+    ownershipDocument?.nonDerivativeTable?.nonDerivativeTransaction || [];
+
+  const txs = Array.isArray(nonDerivTable)
+    ? nonDerivTable
+    : [nonDerivTable].filter(Boolean);
+
+  // Keep only purchases ("P")
+  const purchases = txs
+    .map((t) => {
+      const code = safeText(
+        t?.transactionCoding?.transactionCode || t?.transactionCode
+      );
+      if (code !== "P") return null;
+
+      const shares = Number(
+        t?.transactionAmounts?.transactionShares?.value ??
+          t?.transactionShares?.value ??
+          t?.transactionShares ??
+          0
+      );
+      const price = Number(
+        t?.transactionAmounts?.transactionPricePerShare?.value ??
+          t?.transactionPricePerShare?.value ??
+          t?.transactionPricePerShare ??
+          0
+      );
+      const date = safeText(
+        t?.transactionDate?.value ?? t?.transactionDate ?? ""
+      );
+
+      if (!Number.isFinite(shares) || !Number.isFinite(price)) return null;
+
+      return {
+        issuerTradingSymbol,
+        issuerName,
+        ownerName,
+        ownerTitle,
+        shares,
+        pricePerShare: price,
+        transactionDate: isoDateOnly(date),
+        totalValue: Math.round(shares * price),
+      };
+    })
+    .filter(Boolean);
+
+  return purchases;
+}
+
+// --- BEST-EFFORT in-memory cache across warm invocations ---
+globalThis.__INSIDER_CACHE__ = globalThis.__INSIDER_CACHE__ || {
+  ts: 0,
+  key: "",
+  data: null,
+};
+const memCache = globalThis.__INSIDER_CACHE__;
+
+// Main handler
 export default async function handler(req, res) {
-  const ua = process.env.SEC_USER_AGENT;
-  if (!ua) {
+  // Edge cache headers (lets Vercel cache responses)
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.setHeader("Cache-Control", "s-maxage=300, stale-while-revalidate=3600");
+
+  const SEC_UA = process.env.SEC_USER_AGENT; // you already set this
+  if (!SEC_UA) {
     return res.status(500).json({
-      error: "Missing SEC_USER_AGENT env var. Set it in Vercel project settings.",
+      error: "Missing SEC_USER_AGENT env var",
+      hint: 'Set SEC_USER_AGENT like: "YourAppName (youremail+insiderscope@gmail.com)"',
     });
   }
 
-  const limit = clampInt(req.query.limit, 25, 1, 200);
-  const days = clampInt(req.query.days, 30, 1, 180);
-
-  // NEW: cap how many filings we scan per request so it can't hang/time out
-  // (you can raise this later once caching is in and stable)
-  const scan = clampInt(req.query.scan, 25, 5, 100);
-
+  const limit = clamp(toInt(req.query.limit, 25), 1, 200);
+  const days = clamp(toInt(req.query.days, 30), 1, 365);
   const debug = String(req.query.debug || "") === "1";
 
-  const cacheKey = `${limit}:${days}:${scan}`;
-  const now = Date.now();
+  // scan = how many Atom entries we will attempt to fully parse (each may trigger extra SEC calls)
+  const scanCap = clamp(toInt(req.query.scan, 15), 1, 50);
 
-  if (cache.key === cacheKey && now - cache.ts < CACHE_TTL_MS) {
-    if (debug) return res.status(200).json({ data: cache.data, debug: { ...cache.debug, cache: "hit-fresh" } });
-    return res.status(200).json(cache.data);
+  const cacheKey = `limit=${limit}|days=${days}|scan=${scanCap}`;
+  const now = Date.now();
+  const cacheTtlMs = 5 * 60 * 1000; // 5 min
+
+  // Serve in-memory cache if fresh
+  if (
+    memCache.data &&
+    memCache.key === cacheKey &&
+    now - memCache.ts < cacheTtlMs
+  ) {
+    return res.status(200).json(
+      debug
+        ? { data: memCache.data, debug: { cache: "mem-hit", limit, days, scanCap } }
+        : memCache.data
+    );
   }
+
+  // Atom feed: "Insider Transactions (Form 4)"
+  // NOTE: SEC sometimes changes feeds; this one is commonly used.
+  const atomUrl = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&count=100&output=atom";
 
   const headers = {
-    "User-Agent": ua,
-    "Accept-Encoding": "gzip, deflate, br",
-    Accept: "application/atom+xml,application/xml,text/xml;q=0.9,*/*;q=0.8",
+    "User-Agent": SEC_UA,
+    Accept: "application/atom+xml,application/xml,text/xml,*/*",
+    "Accept-Encoding": "identity",
   };
 
-  const cutoffIso = daysAgoIso(days);
-
+  let atomXml;
   try {
-    const atom = await fetchText(BASE_ATOM, headers);
-
-    if (!atom.ok) {
-      if ((atom.status === 429 || atom.status === 403) && cache.data?.length) {
-        if (debug) {
-          return res.status(200).json({
-            data: cache.data,
-            debug: { cache: "hit-stale", reason: `SEC Atom fetch failed (${atom.status})` },
-          });
-        }
-        return res.status(200).json(cache.data);
+    const atomResp = await fetch(atomUrl, { headers });
+    if (atomResp.status === 429) {
+      // If we have any cached data (even stale), return it instead of failing hard
+      if (memCache.data) {
+        return res.status(200).json(
+          debug
+            ? {
+                data: memCache.data,
+                debug: { cache: "mem-stale-after-429", limit, days, scanCap, atomStatus: 429 },
+              }
+            : memCache.data
+        );
       }
-      return res.status(atom.status).json({
-        error: `SEC Atom fetch failed (${atom.status})`,
-        hint: "SEC rate limited you. Try again later.",
+      return res.status(429).json({
+        error: "SEC Atom fetch failed (429)",
+        hint: "SEC rate limited the backend. Add caching/throttling (this file does), then redeploy and avoid rapid refreshes.",
       });
     }
-
-    const entries = extractAllEntries(atom.text);
-    const out = [];
-    const errors = [];
-
-    let filingsScanned = 0;
-
-    for (const entryXml of entries) {
-      if (out.length >= limit) break;
-      if (filingsScanned >= scan) break;
-
-      const updated = extractTag(entryXml, "updated") || extractTag(entryXml, "published");
-      if (updated && new Date(updated).toISOString() < cutoffIso) continue;
-
-      const hrefs = extractLinksFromEntry(entryXml);
-      const indexUrl = pickFilingIndexHtmlLink(hrefs);
-      if (!indexUrl) continue;
-
-      filingsScanned++;
-
-      try {
-        const indexHtml = await fetchFilingIndexHtml(indexUrl, headers);
-        const form4Xml = await fetchForm4Xml(indexUrl, indexHtml, headers);
-        if (!form4Xml) continue;
-
-        const issuerName = extractTagValue(form4Xml, "issuerName") || extractTag(form4Xml, "issuerName");
-        const issuerTradingSymbol =
-          extractTagValue(form4Xml, "issuerTradingSymbol") || extractTag(form4Xml, "issuerTradingSymbol");
-
-        const reportingOwnerName =
-          extractTagValue(form4Xml, "rptOwnerName") || extractTag(form4Xml, "rptOwnerName");
-        const officerTitle = extractTagValue(form4Xml, "officerTitle") || extractTag(form4Xml, "officerTitle");
-
-        const role = officerTitle || null;
-        const txs = parseTransactionsFromForm4Xml(form4Xml);
-
-        for (const t of txs) {
-          if (out.length >= limit) break;
-
-          const totalValue =
-            typeof t.shares === "number" && typeof t.pricePerShare === "number"
-              ? t.shares * t.pricePerShare
-              : null;
-
-          out.push({
-            id: `${(reportingOwnerName || "insider").toLowerCase().replace(/\s+/g, "-")}-${issuerTradingSymbol || "na"}-${t.transactionDate || "na"}`,
-            insiderName: reportingOwnerName || null,
-            insiderTitle: role,
-            employerTicker: issuerTradingSymbol || null,
-            employerCompany: issuerName || null,
-            purchasedTicker: issuerTradingSymbol || null,
-            purchasedCompany: issuerName || null,
-            shares: t.shares,
-            pricePerShare: t.pricePerShare,
-            totalValue,
-            transactionDate: t.transactionDate || null,
-            signalScore: computeSignalScore(totalValue, role),
-            purchaseType: "own-company",
-          });
-        }
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        errors.push({ indexUrl, message: msg });
-      }
+    if (!atomResp.ok) {
+      return res.status(atomResp.status).json({
+        error: `SEC Atom fetch failed (${atomResp.status})`,
+      });
     }
+    atomXml = await atomResp.text();
+  } catch (e) {
+    return res.status(500).json({ error: "SEC Atom fetch threw", detail: String(e) });
+  }
 
-    cache = {
-      ts: now,
-      key: cacheKey,
+  const entries = parseAtom(atomXml);
+
+  // Filter by days cutoff using Atom "updated"/"published"
+  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+
+  const recentEntries = entries
+    .map((en) => {
+      const linkHref =
+        en?.link?.href ||
+        (Array.isArray(en?.link) ? en.link[0]?.href : null) ||
+        "";
+      const updated = safeText(en?.updated || en?.published || "");
+      const ts = updated ? Date.parse(updated) : 0;
+      return { linkHref, updated, ts };
+    })
+    .filter((x) => x.linkHref && x.ts && x.ts >= cutoff)
+    .slice(0, scanCap);
+
+  // Now for each entry:
+  // 1) get index.json
+  // 2) pick an XML
+  // 3) fetch XML
+  // 4) parse purchases
+  const out = [];
+  const errorsSample = [];
+
+  for (let i = 0; i < recentEntries.length; i++) {
+    const { linkHref, updated } = recentEntries[i];
+    const meta = extractCikAndAccession(linkHref);
+    if (!meta) continue;
+
+    try {
+      // throttle to be nice to SEC
+      if (i > 0) await sleep(250);
+
+      const idxUrl = indexJsonUrl(meta.cik, meta.accessionNo);
+      const idxResp = await fetch(idxUrl, { headers });
+
+      if (idxResp.status === 429) {
+        errorsSample.push({ where: "index.json", status: 429, idxUrl });
+        break; // stop to avoid a cascade of 429s
+      }
+      if (!idxResp.ok) {
+        errorsSample.push({ where: "index.json", status: idxResp.status, idxUrl });
+        continue;
+      }
+
+      const idxJson = await idxResp.json();
+      const xmlName = pickForm4Xml(idxJson);
+      if (!xmlName) continue;
+
+      const nodash = meta.accessionNo.replace(/-/g, "");
+      const xmlUrl = `https://data.sec.gov/Archives/edgar/data/${Number(
+        meta.cik
+      )}/${nodash}/${xmlName}`;
+
+      // throttle again
+      await sleep(250);
+
+      const xmlResp = await fetch(xmlUrl, { headers });
+
+      if (xmlResp.status === 429) {
+        errorsSample.push({ where: "form4.xml", status: 429, xmlUrl });
+        break;
+      }
+      if (!xmlResp.ok) {
+        errorsSample.push({ where: "form4.xml", status: xmlResp.status, xmlUrl });
+        continue;
+      }
+
+      const xmlText = await xmlResp.text();
+      const purchases = parseForm4Xml(xmlText);
+
+      // Convert to your frontend schema
+      for (const p of purchases) {
+        const id = `${p.ownerName || "owner"}-${p.issuerTradingSymbol || "sym"}-${p.transactionDate || isoDateOnly(updated)}`;
+
+        out.push({
+          id,
+          insiderName: p.ownerName || "—",
+          insiderTitle: p.ownerTitle || "—",
+          employerTicker: p.issuerTradingSymbol || "—",
+          employerCompany: p.issuerName || "—",
+          purchasedTicker: p.issuerTradingSymbol || "—",
+          purchasedCompany: p.issuerName || "—",
+          shares: p.shares,
+          pricePerShare: p.pricePerShare,
+          totalValue: p.totalValue,
+          transactionDate: p.transactionDate || isoDateOnly(updated),
+          signalScore: 50, // placeholder; you can compute later
+          purchaseType: "own-company",
+        });
+
+        if (out.length >= limit) break;
+      }
+
+      if (out.length >= limit) break;
+    } catch (e) {
+      errorsSample.push({ where: "loop", error: String(e) });
+    }
+  }
+
+  // Save to in-memory cache (even if empty, so we don’t hammer SEC on refresh)
+  memCache.ts = Date.now();
+  memCache.key = cacheKey;
+  memCache.data = out;
+
+  if (debug) {
+    return res.status(200).json({
       data: out,
       debug: {
-        cache: "miss-refresh",
+        cache: "miss-fill",
         returned: out.length,
         entriesSeen: entries.length,
-        filingsScanned,
-        scanCap: scan,
-        cutoff: cutoffIso,
-        errorsSample: errors.slice(0, 10),
+        recentEntries: recentEntries.length,
+        cutoff: new Date(cutoff).toISOString(),
+        scanCap,
+        errorsSample,
       },
-    };
-
-    if (debug) return res.status(200).json({ data: out, debug: cache.debug });
-    return res.status(200).json(out);
-  } catch (e) {
-    return res.status(500).json({ error: e instanceof Error ? e.message : "Unknown error" });
+    });
   }
+
+  return res.status(200).json(out);
 }
