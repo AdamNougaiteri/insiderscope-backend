@@ -10,7 +10,6 @@ const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 const safeText = (v) => (v === null || v === undefined ? "" : String(v).trim());
 const isoDateOnly = (s) => (s ? String(s).slice(0, 10) : null);
 
-// Best-effort warm cache
 globalThis.__INSIDER_CACHE__ = globalThis.__INSIDER_CACHE__ || {
   ts: 0,
   key: "",
@@ -18,29 +17,17 @@ globalThis.__INSIDER_CACHE__ = globalThis.__INSIDER_CACHE__ || {
 };
 const memCache = globalThis.__INSIDER_CACHE__;
 
-// Prefer the Atom link that contains /Archives/
 function pickArchivesLink(entry) {
   const links = entry?.link;
   if (!links) return "";
   const arr = Array.isArray(links) ? links : [links];
   const hrefs = arr.map((l) => safeText(l?.href)).filter(Boolean);
-  return (
-    hrefs.find((h) => h.includes("/Archives/")) ||
-    hrefs[0] ||
-    ""
-  );
+  return hrefs.find((h) => h.includes("/Archives/")) || hrefs[0] || "";
 }
 
-// Extract cik + accession from archive URL (handles dashed or nodash accession)
 function extractCikAndAccession(url) {
   const u = safeText(url);
-
-  // matches:
-  // /edgar/data/1935209/000119312525331321/
-  // /edgar/data/1935209/0001193125-25-331321/
-  const m = u.match(
-    /edgar\/data\/(\d+)\/(\d{18}|\d{10}-\d{2}-\d{6})/i
-  );
+  const m = u.match(/edgar\/data\/(\d+)\/(\d{18}|\d{10}-\d{2}-\d{6})/i);
   if (!m) return null;
 
   const cik = m[1];
@@ -51,11 +38,9 @@ function extractCikAndAccession(url) {
     : `${acc.slice(0, 10)}-${acc.slice(10, 12)}-${acc.slice(12)}`;
 
   const accessionNoNoDash = accessionNoDashed.replace(/-/g, "");
-
   return { cik, accessionNoDashed, accessionNoNoDash };
 }
 
-// IMPORTANT: use www.sec.gov/Archives for archive files
 function indexJsonUrl(cik, accessionNoNoDash) {
   return `https://www.sec.gov/Archives/edgar/data/${Number(
     cik
@@ -71,6 +56,7 @@ function pickForm4Xml(indexJson) {
     .filter(Boolean)
     .filter((n) => n.toLowerCase().endsWith(".xml"));
 
+  // Prefer "form4" or "primary", otherwise first xml
   return (
     xmls.find((n) => n.toLowerCase().includes("form4")) ||
     xmls.find((n) => n.toLowerCase().includes("primary")) ||
@@ -91,75 +77,95 @@ function parseAtom(xml) {
   return entries;
 }
 
-// Minimal Form 4 parser: purchases ("P") in non-derivatives
-function parseForm4Xml(xmlText) {
-  const parser = new XMLParser({
-    ignoreAttributes: false,
-    attributeNamePrefix: "",
-  });
-  const doc = parser.parse(xmlText);
-  const ownershipDocument = doc?.ownershipDocument || doc?.document || doc || {};
+// ---------- Regex-based Form 4 parsing (robust) ----------
+function firstTag(xml, tag) {
+  const re = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i");
+  const m = xml.match(re);
+  return m ? safeText(m[1]) : "";
+}
 
-  const issuer = ownershipDocument?.issuer || {};
-  const reportingOwner = ownershipDocument?.reportingOwner || {};
-  const ro = Array.isArray(reportingOwner)
-    ? reportingOwner[0]
-    : reportingOwner || {};
-
-  const issuerTradingSymbol = safeText(issuer?.issuerTradingSymbol);
-  const issuerName = safeText(issuer?.issuerName);
-
-  const ownerName = safeText(
-    ro?.reportingOwnerId?.rptOwnerName || ro?.rptOwnerName
+function firstNestedTag(xml, parentTag, childTag) {
+  const parentRe = new RegExp(
+    `<${parentTag}[^>]*>([\\s\\S]*?)<\\/${parentTag}>`,
+    "i"
   );
-  const ownerTitle = safeText(
-    ro?.reportingOwnerRelationship?.officerTitle ||
-      ro?.officerTitle ||
-      ro?.reportingOwnerRelationship?.otherText
-  );
+  const pm = xml.match(parentRe);
+  if (!pm) return "";
+  const parentBody = pm[1];
+  return firstTag(parentBody, childTag);
+}
 
-  const table =
-    ownershipDocument?.nonDerivativeTable?.nonDerivativeTransaction || [];
-  const txs = Array.isArray(table) ? table : [table].filter(Boolean);
+function parseNumberTag(block, tag) {
+  // handles <tag><value>123</value></tag> or <tag>123</tag>
+  const inner = firstTag(block, tag);
+  if (!inner) return null;
+  const v = firstTag(inner, "value") || inner;
+  const n = Number(String(v).replace(/,/g, ""));
+  return Number.isFinite(n) ? n : null;
+}
 
-  const purchases = txs
-    .map((t) => {
-      const code = safeText(
-        t?.transactionCoding?.transactionCode || t?.transactionCode
-      );
-      if (code !== "P") return null;
+function parseDateTag(block, tag) {
+  const inner = firstTag(block, tag);
+  if (!inner) return null;
+  const v = firstTag(inner, "value") || inner;
+  return isoDateOnly(v);
+}
 
-      const shares = Number(
-        t?.transactionAmounts?.transactionShares?.value ??
-          t?.transactionShares?.value ??
-          t?.transactionShares ??
-          0
-      );
-      const price = Number(
-        t?.transactionAmounts?.transactionPricePerShare?.value ??
-          t?.transactionPricePerShare?.value ??
-          t?.transactionPricePerShare ??
-          0
-      );
-      const date = safeText(t?.transactionDate?.value ?? t?.transactionDate ?? "");
+function parseForm4PurchasesRegex(xmlText) {
+  const issuerTradingSymbol =
+    firstNestedTag(xmlText, "issuer", "issuerTradingSymbol") ||
+    firstTag(xmlText, "issuerTradingSymbol");
 
-      if (!Number.isFinite(shares) || !Number.isFinite(price)) return null;
+  const issuerName =
+    firstNestedTag(xmlText, "issuer", "issuerName") || firstTag(xmlText, "issuerName");
 
-      return {
-        issuerTradingSymbol,
-        issuerName,
-        ownerName,
-        ownerTitle,
-        shares,
-        pricePerShare: price,
-        transactionDate: isoDateOnly(date),
-        totalValue: Math.round(shares * price),
-      };
-    })
-    .filter(Boolean);
+  // reporting owner name/title can appear multiple times; take first match
+  const ownerName =
+    firstTag(xmlText, "rptOwnerName") || firstTag(xmlText, "reportingOwnerName");
+
+  const officerTitle = firstTag(xmlText, "officerTitle");
+
+  // grab all nonDerivativeTransaction blocks
+  const txBlocks = [];
+  const txRe = /<nonDerivativeTransaction[^>]*>([\s\S]*?)<\/nonDerivativeTransaction>/gi;
+  let m;
+  while ((m = txRe.exec(xmlText)) !== null) {
+    txBlocks.push(m[1]);
+    if (txBlocks.length > 200) break;
+  }
+
+  const purchases = [];
+  for (const block of txBlocks) {
+    const code =
+      firstNestedTag(block, "transactionCoding", "transactionCode") ||
+      firstTag(block, "transactionCode");
+
+    if (safeText(code) !== "P") continue;
+
+    const shares =
+      parseNumberTag(block, "transactionShares") ??
+      parseNumberTag(block, "transactionSharesValue");
+
+    const price = parseNumberTag(block, "transactionPricePerShare");
+    const date = parseDateTag(block, "transactionDate");
+
+    if (!Number.isFinite(shares) || !Number.isFinite(price)) continue;
+
+    purchases.push({
+      issuerTradingSymbol: issuerTradingSymbol || "",
+      issuerName: issuerName || "",
+      ownerName: ownerName || "",
+      officerTitle: officerTitle || "",
+      shares,
+      pricePerShare: price,
+      transactionDate: date,
+      totalValue: Math.round(shares * price),
+    });
+  }
 
   return purchases;
 }
+// --------------------------------------------------------
 
 export default async function handler(req, res) {
   res.setHeader("Content-Type", "application/json; charset=utf-8");
@@ -169,14 +175,13 @@ export default async function handler(req, res) {
   if (!SEC_UA) {
     return res.status(500).json({
       error: "Missing SEC_USER_AGENT env var",
-      hint:
-        'Set SEC_USER_AGENT like: "InsiderScope (your_email@example.com)"',
+      hint: 'Set SEC_USER_AGENT like: "InsiderScope (your_email@example.com)"',
     });
   }
 
   const limit = clamp(toInt(req.query.limit, 25), 1, 200);
   const days = clamp(toInt(req.query.days, 30), 1, 365);
-  const scanCap = clamp(toInt(req.query.scan, 15), 1, 50);
+  const scanCap = clamp(toInt(req.query.scan, 25), 1, 60);
   const debug = String(req.query.debug || "") === "1";
 
   const cacheKey = `limit=${limit}|days=${days}|scan=${scanCap}`;
@@ -220,7 +225,7 @@ export default async function handler(req, res) {
       }
       return res.status(429).json({
         error: "SEC Atom fetch failed (429)",
-        hint: "SEC rate limited the backend. Reduce refreshes; caching should prevent repeated scrapes.",
+        hint: "SEC rate limited the backend. Reduce refreshes.",
       });
     }
     if (!atomResp.ok) {
@@ -248,6 +253,7 @@ export default async function handler(req, res) {
 
   const out = [];
   const errorsSample = [];
+  const samples = [];
 
   for (let i = 0; i < recentEntries.length; i++) {
     const { linkHref, updated } = recentEntries[i];
@@ -290,25 +296,37 @@ export default async function handler(req, res) {
       }
 
       const xmlText = await xmlResp.text();
-      const purchases = parseForm4Xml(xmlText);
+      const purchases = parseForm4PurchasesRegex(xmlText);
+
+      if (debug && samples.length < 5) {
+        samples.push({
+          idxUrl,
+          xmlUrl,
+          xmlName,
+          purchasesFound: purchases.length,
+          issuerTradingSymbol: firstTag(xmlText, "issuerTradingSymbol"),
+          rptOwnerName: firstTag(xmlText, "rptOwnerName"),
+        });
+      }
 
       for (const p of purchases) {
-        const id = `${p.ownerName || "owner"}-${p.issuerTradingSymbol || "sym"}-${
-          p.transactionDate || isoDateOnly(updated)
-        }`;
+        const dt = p.transactionDate || isoDateOnly(updated);
+        const sym = p.issuerTradingSymbol || "—";
+        const nm = p.ownerName || "—";
+        const id = `${nm}-${sym}-${dt}`;
 
         out.push({
           id,
-          insiderName: p.ownerName || "—",
-          insiderTitle: p.ownerTitle || "—",
-          employerTicker: p.issuerTradingSymbol || "—",
+          insiderName: nm,
+          insiderTitle: p.officerTitle || "—",
+          employerTicker: sym,
           employerCompany: p.issuerName || "—",
-          purchasedTicker: p.issuerTradingSymbol || "—",
+          purchasedTicker: sym,
           purchasedCompany: p.issuerName || "—",
           shares: p.shares,
           pricePerShare: p.pricePerShare,
           totalValue: p.totalValue,
-          transactionDate: p.transactionDate || isoDateOnly(updated),
+          transactionDate: dt,
           signalScore: 50, // placeholder
           purchaseType: "own-company",
         });
@@ -337,6 +355,7 @@ export default async function handler(req, res) {
         cutoff: new Date(cutoff).toISOString(),
         scanCap,
         errorsSample,
+        samples,
       },
     });
   }
