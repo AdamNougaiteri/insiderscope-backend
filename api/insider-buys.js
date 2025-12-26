@@ -13,7 +13,7 @@ const parser = new XMLParser({
   attributeNamePrefix: "",
 });
 
-// --- helpers --------------------------------------------------
+// -------------------- helpers --------------------
 
 function cleanText(v) {
   if (!v) return "";
@@ -28,7 +28,7 @@ function parseNumber(v) {
 function extractCompanyAndTicker(raw) {
   if (!raw) return { companyName: "Unknown", ticker: "UNKNOWN" };
 
-  // Example raw values seen in Form 4 titles
+  // Examples:
   // "4 - ONDAS HOLDINGS INC (0001646188)"
   // "4 - IonQ, Inc. (0001824920)"
 
@@ -46,7 +46,7 @@ function extractCompanyAndTicker(raw) {
   };
 }
 
-// --- main handler --------------------------------------------
+// -------------------- handler --------------------
 
 export default async function handler(req, res) {
   try {
@@ -65,9 +65,6 @@ export default async function handler(req, res) {
     for (const e of entries) {
       const title = cleanText(e.title);
       const summary = cleanText(e.summary);
-
-      // Only purchases
-      if (!summary.includes("Transaction: P")) continue;
 
       const { companyName, ticker } = extractCompanyAndTicker(title);
 
@@ -93,7 +90,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // sort by largest buys
+    // sort by largest dollar value
     transactions.sort((a, b) => b.totalValue - a.totalValue);
 
     res.status(200).json(transactions);
