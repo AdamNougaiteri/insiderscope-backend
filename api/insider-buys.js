@@ -31,12 +31,8 @@ function ensureArray(v) {
 
 function deepFindAll(obj, keyName, out = []) {
   if (!obj || typeof obj !== "object") return out;
-  if (Object.prototype.hasOwnProperty.call(obj, keyName)) {
-    out.push(obj[keyName]);
-  }
-  for (const k of Object.keys(obj)) {
-    deepFindAll(obj[k], keyName, out);
-  }
+  if (Object.prototype.hasOwnProperty.call(obj, keyName)) out.push(obj[keyName]);
+  for (const k of Object.keys(obj)) deepFindAll(obj[k], keyName, out);
   return out;
 }
 
@@ -108,18 +104,15 @@ function numVal(v) {
 }
 
 function valueField(node) {
-  // Form4 often: { value: "123" }
   if (node && typeof node === "object" && "value" in node) return node.value;
   return node;
 }
 
 function parseForm4Purchases(xmlTextRaw, debugCapture = null) {
   const xmlText = stripNamespaces(xmlTextRaw);
-
   const parser = new XMLParser({
     ignoreAttributes: false,
     attributeNamePrefix: "",
-    // keep order off; standard object parse
   });
 
   let doc;
@@ -130,10 +123,8 @@ function parseForm4Purchases(xmlTextRaw, debugCapture = null) {
     return [];
   }
 
-  // SEC Form 4 root commonly: ownershipDocument
   const root = doc?.ownershipDocument || doc;
 
-  // issuer / owner
   const issuerTradingSymbol =
     safeText(root?.issuer?.issuerTradingSymbol) ||
     safeText(root?.issuerTradingSymbol) ||
@@ -154,8 +145,6 @@ function parseForm4Purchases(xmlTextRaw, debugCapture = null) {
     safeText(root?.officerTitle) ||
     "";
 
-  // Non-derivative transactions live here:
-  // ownershipDocument.nonDerivativeTable.nonDerivativeTransaction (array or object)
   let txs =
     root?.nonDerivativeTable?.nonDerivativeTransaction ??
     root?.nonDerivativeTransaction ??
@@ -163,15 +152,11 @@ function parseForm4Purchases(xmlTextRaw, debugCapture = null) {
 
   txs = ensureArray(txs);
 
-  // If not found, do a deep search fallback (covers odd layouts)
   if (txs.length === 0) {
     const hits = deepFindAll(root, "nonDerivativeTransaction");
-    for (const h of hits) {
-      txs.push(...ensureArray(h));
-    }
+    for (const h of hits) txs.push(...ensureArray(h));
   }
 
-  // Debug: count codes seen
   if (debugCapture) {
     const codes = {};
     for (const t of txs) {
@@ -232,6 +217,16 @@ function parseForm4Purchases(xmlTextRaw, debugCapture = null) {
   return purchases;
 }
 
+async function fetchAtomPage({ start, headers }) {
+  // browse-edgar supports `start` for pagination
+  const url =
+    `https://www.sec.gov/cgi-bin/browse-edgar?` +
+    `action=getcurrent&type=4&count=100&start=${start}&output=atom`;
+
+  const resp = await fetch(url, { headers });
+  return { resp, url };
+}
+
 export default async function handler(req, res) {
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.setHeader("Cache-Control", "s-maxage=300, stale-while-revalidate=3600");
@@ -246,24 +241,25 @@ export default async function handler(req, res) {
 
   const limit = clamp(toInt(req.query.limit, 25), 1, 200);
   const days = clamp(toInt(req.query.days, 30), 1, 365);
-  const scanCap = clamp(toInt(req.query.scan, 25), 1, 60);
+  const scanCap = clamp(toInt(req.query.scan, 50), 1, 200); // entries per page to consider
+  const pages = clamp(toInt(req.query.pages, 3), 1, 10); // how many Atom pages to fetch
   const debug = String(req.query.debug || "") === "1";
   const v = safeText(req.query.v || ""); // cache buster
 
-  const cacheKey = `limit=${limit}|days=${days}|scan=${scanCap}|v=${v}`;
+  const cacheKey = `limit=${limit}|days=${days}|scan=${scanCap}|pages=${pages}|v=${v}`;
   const now = Date.now();
   const cacheTtlMs = 5 * 60 * 1000;
 
   if (memCache.data && memCache.key === cacheKey && now - memCache.ts < cacheTtlMs) {
     return res.status(200).json(
       debug
-        ? { data: memCache.data, debug: { cache: "mem-hit", limit, days, scanCap } }
+        ? {
+            data: memCache.data,
+            debug: { cache: "mem-hit", limit, days, scanCap, pages },
+          }
         : memCache.data
     );
   }
-
-  const atomUrl =
-    "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&count=100&output=atom";
 
   const headers = {
     "User-Agent": SEC_UA,
@@ -271,118 +267,134 @@ export default async function handler(req, res) {
     "Accept-Encoding": "identity",
   };
 
-  let atomXml;
-  try {
-    const atomResp = await fetch(atomUrl, { headers });
-    if (atomResp.status === 429) {
-      return res.status(429).json({
-        error: "SEC Atom fetch failed (429)",
-        hint: "SEC rate limited the backend.",
-      });
-    }
-    if (!atomResp.ok) {
-      return res.status(atomResp.status).json({
-        error: `SEC Atom fetch failed (${atomResp.status})`,
-      });
-    }
-    atomXml = await atomResp.text();
-  } catch (e) {
-    return res.status(500).json({ error: "SEC Atom fetch threw", detail: String(e) });
-  }
-
-  const entries = parseAtom(atomXml);
   const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
-
-  const recentEntries = entries
-    .map((en) => {
-      const linkHref = pickArchivesLink(en);
-      const updated = safeText(en?.updated || en?.published || "");
-      const ts = updated ? Date.parse(updated) : 0;
-      return { linkHref, updated, ts };
-    })
-    .filter((x) => x.linkHref && x.ts && x.ts >= cutoff)
-    .slice(0, scanCap);
 
   const out = [];
   const errorsSample = [];
   const samples = [];
+  let entriesSeenTotal = 0;
 
-  for (let i = 0; i < recentEntries.length; i++) {
-    const { linkHref, updated } = recentEntries[i];
-    const meta = extractCikAndAccession(linkHref);
-    if (!meta) continue;
+  // hard throttle to reduce 429
+  const betweenCallsMs = clamp(toInt(req.query.throttle, 700), 250, 2000);
 
+  for (let p = 0; p < pages; p++) {
+    const start = p * 100;
+
+    let atomXml;
+    let atomUrl;
     try {
-      if (i > 0) await sleep(250);
+      if (p > 0) await sleep(betweenCallsMs);
+      const { resp, url } = await fetchAtomPage({ start, headers });
+      atomUrl = url;
 
-      const idxUrl = indexJsonUrl(meta.cik, meta.accessionNoNoDash);
-      const idxResp = await fetch(idxUrl, { headers });
-
-      if (!idxResp.ok) {
-        errorsSample.push({ where: "index.json", status: idxResp.status, idxUrl });
-        continue;
-      }
-
-      const idxJson = await idxResp.json();
-      const xmlName = pickForm4Xml(idxJson);
-      if (!xmlName) continue;
-
-      const xmlUrl = `https://www.sec.gov/Archives/edgar/data/${Number(
-        meta.cik
-      )}/${meta.accessionNoNoDash}/${xmlName}`;
-
-      await sleep(250);
-
-      const xmlResp = await fetch(xmlUrl, { headers });
-      if (!xmlResp.ok) {
-        errorsSample.push({ where: "form4.xml", status: xmlResp.status, xmlUrl });
-        continue;
-      }
-
-      const xmlText = await xmlResp.text();
-
-      const dbg = debug ? {} : null;
-      const purchases = parseForm4Purchases(xmlText, dbg);
-
-      if (debug && samples.length < 12) {
-        samples.push({
-          idxUrl,
-          xmlUrl,
-          xmlName,
-          purchasesFound: purchases.length,
-          ...(dbg || {}),
+      if (resp.status === 429) {
+        return res.status(429).json({
+          error: "SEC Atom fetch failed (429)",
+          hint: "SEC rate limited the backend. Increase throttle and/or reduce pages.",
+          debug: { atomUrl, start, pages, throttle: betweenCallsMs },
         });
       }
-
-      for (const p of purchases) {
-        const dt = p.transactionDate || isoDateOnly(updated);
-        const sym = p.issuerTradingSymbol || "—";
-        const nm = p.ownerName || "—";
-        const id = `${nm}-${sym}-${dt}-${Math.random().toString(16).slice(2)}`;
-
-        out.push({
-          id,
-          insiderName: nm,
-          insiderTitle: p.officerTitle || "—",
-          employerTicker: sym,
-          employerCompany: p.issuerName || "—",
-          purchasedTicker: sym,
-          purchasedCompany: p.issuerName || "—",
-          shares: p.shares,
-          pricePerShare: p.pricePerShare,
-          totalValue: p.totalValue,
-          transactionDate: dt,
-          signalScore: 50,
-          purchaseType: "own-company",
-        });
-
-        if (out.length >= limit) break;
+      if (!resp.ok) {
+        errorsSample.push({ where: "atom", status: resp.status, atomUrl });
+        continue;
       }
-
-      if (out.length >= limit) break;
+      atomXml = await resp.text();
     } catch (e) {
-      errorsSample.push({ where: "loop", error: String(e) });
+      errorsSample.push({ where: "atom", error: String(e), atomUrl });
+      continue;
     }
+
+    const entries = parseAtom(atomXml);
+    entriesSeenTotal += entries.length;
+
+    const recentEntries = entries
+      .map((en) => {
+        const linkHref = pickArchivesLink(en);
+        const updated = safeText(en?.updated || en?.published || "");
+        const ts = updated ? Date.parse(updated) : 0;
+        return { linkHref, updated, ts };
+      })
+      .filter((x) => x.linkHref && x.ts && x.ts >= cutoff)
+      .slice(0, scanCap);
+
+    for (let i = 0; i < recentEntries.length; i++) {
+      if (out.length >= limit) break;
+
+      const { linkHref, updated } = recentEntries[i];
+      const meta = extractCikAndAccession(linkHref);
+      if (!meta) continue;
+
+      try {
+        await sleep(betweenCallsMs);
+
+        const idxUrl = indexJsonUrl(meta.cik, meta.accessionNoNoDash);
+        const idxResp = await fetch(idxUrl, { headers });
+        if (!idxResp.ok) {
+          errorsSample.push({ where: "index.json", status: idxResp.status, idxUrl });
+          continue;
+        }
+
+        const idxJson = await idxResp.json();
+        const xmlName = pickForm4Xml(idxJson);
+        if (!xmlName) continue;
+
+        const xmlUrl = `https://www.sec.gov/Archives/edgar/data/${Number(
+          meta.cik
+        )}/${meta.accessionNoNoDash}/${xmlName}`;
+
+        await sleep(betweenCallsMs);
+
+        const xmlResp = await fetch(xmlUrl, { headers });
+        if (!xmlResp.ok) {
+          errorsSample.push({ where: "form4.xml", status: xmlResp.status, xmlUrl });
+          continue;
+        }
+
+        const xmlText = await xmlResp.text();
+
+        const dbg = debug ? {} : null;
+        const purchases = parseForm4Purchases(xmlText, dbg);
+
+        if (debug && samples.length < 20) {
+          samples.push({
+            idxUrl,
+            xmlUrl,
+            xmlName,
+            purchasesFound: purchases.length,
+            ...(dbg || {}),
+          });
+        }
+
+        for (const pch of purchases) {
+          const dt = pch.transactionDate || isoDateOnly(updated);
+          const sym = pch.issuerTradingSymbol || "—";
+          const nm = pch.ownerName || "—";
+          const id = `${nm}-${sym}-${dt}-${Math.random().toString(16).slice(2)}`;
+
+          out.push({
+            id,
+            insiderName: nm,
+            insiderTitle: pch.officerTitle || "—",
+            employerTicker: sym,
+            employerCompany: pch.issuerName || "—",
+            purchasedTicker: sym,
+            purchasedCompany: pch.issuerName || "—",
+            shares: pch.shares,
+            pricePerShare: pch.pricePerShare,
+            totalValue: pch.totalValue,
+            transactionDate: dt,
+            signalScore: 50,
+            purchaseType: "own-company",
+          });
+
+          if (out.length >= limit) break;
+        }
+      } catch (e) {
+        errorsSample.push({ where: "loop", error: String(e) });
+      }
+    }
+
+    if (out.length >= limit) break;
   }
 
   memCache.ts = Date.now();
@@ -395,10 +407,11 @@ export default async function handler(req, res) {
       debug: {
         cache: "miss-fill",
         returned: out.length,
-        entriesSeen: entries.length,
-        recentEntries: recentEntries.length,
+        entriesSeen: entriesSeenTotal,
         cutoff: new Date(cutoff).toISOString(),
         scanCap,
+        pages,
+        throttle: betweenCallsMs,
         errorsSample,
         samples,
       },
