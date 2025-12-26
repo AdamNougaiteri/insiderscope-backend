@@ -1,59 +1,38 @@
-// api/insider-buys.js
+// services/secDataService.ts
 
-export default async function handler(req, res) {
+export async function fetchRecentBuyTransactions() {
+  const BACKEND_URL =
+    "https://insiderscope-backend.vercel.app/api/insider-buys";
+
   try {
-    const LOOKBACK_DAYS = 365;
-    const today = new Date();
-    const startDate = new Date();
-    startDate.setDate(today.getDate() - LOOKBACK_DAYS);
+    const response = await fetch(BACKEND_URL, {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+      },
+    });
 
-    const headers = {
-      "User-Agent": "InsiderScope/1.0 (contact@example.com)",
-      "Accept-Encoding": "gzip, deflate",
-      "Host": "data.sec.gov",
-    };
-
-    // Get recent Form 4 filings from SEC RSS
-    const rssUrl =
-      "https://www.sec.gov/Archives/edgar/usgaap.rss.xml";
-
-    const rssResponse = await fetch(rssUrl, { headers });
-    if (!rssResponse.ok) {
-      throw new Error("Failed to fetch SEC RSS feed");
+    if (!response.ok) {
+      console.error("Backend returned non-200:", response.status);
+      return [];
     }
 
-    const rssText = await rssResponse.text();
+    const data = await response.json();
 
-    // Very simple Form 4 extraction (intentionally loose)
-    const form4Links = Array.from(
-      rssText.matchAll(/https:\/\/www\.sec\.gov\/Archives\/edgar\/data\/.*?\.txt/g)
-    )
-      .map((m) => m[0])
-      .slice(0, 50); // limit for safety
-
-    const results = [];
-
-    for (const filingUrl of form4Links) {
-      try {
-        const filingRes = await fetch(filingUrl, { headers });
-        if (!filingRes.ok) continue;
-
-        const filingText = await filingRes.text();
-
-        if (!filingText.includes("FORM 4")) continue;
-
-        results.push({
-          filingUrl,
-          detected: true,
-        });
-      } catch {
-        continue;
-      }
+    // Always guarantee an array
+    if (!Array.isArray(data)) {
+      console.error("Unexpected backend payload:", data);
+      return [];
     }
 
-    return res.status(200).json(results);
+    // TEMP: tag data so UI knows backend is alive
+    return data.map((item, index) => ({
+      id: index,
+      status: "pending_parse",
+      ...item,
+    }));
   } catch (error) {
-    console.error("Backend error:", error);
-    return res.status(200).json([]); // NEVER crash frontend
+    console.error("Fetch failed:", error);
+    return [];
   }
 }
