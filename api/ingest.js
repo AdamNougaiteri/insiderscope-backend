@@ -5,7 +5,7 @@ const pool =
   new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false },
-    max: 1, // serverless friendly
+    max: 1,
     idleTimeoutMillis: 10_000,
     connectionTimeoutMillis: 10_000,
   });
@@ -32,15 +32,13 @@ function sleep(ms) {
 }
 
 function getBaseUrl(req) {
-  // Works on Vercel + local dev
   const proto = (req.headers["x-forwarded-proto"] || "https").toString();
   const host = (req.headers["x-forwarded-host"] || req.headers.host).toString();
   return `${proto}://${host}`;
 }
 
 async function ensureSchema(client) {
-  // Minimal schema: keeps your existing tables if they already exist.
-  // Adds required columns/constraints if missing (safe-ish).
+  // --- Companies
   await client.query(`
     CREATE TABLE IF NOT EXISTS companies (
       cik TEXT PRIMARY KEY,
@@ -51,37 +49,41 @@ async function ensureSchema(client) {
     );
   `);
 
+  // Add missing columns safely if table already exists with a different shape
+  await client.query(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS ticker TEXT;`);
+  await client.query(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS company_name TEXT;`);
+  await client.query(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();`);
+  await client.query(`ALTER TABLE companies ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();`);
+
+  // --- Insider transactions
   await client.query(`
     CREATE TABLE IF NOT EXISTS insider_transactions (
-      id TEXT PRIMARY KEY,
-      cik TEXT,
-      employer_ticker TEXT,
-      employer_company TEXT,
-      purchased_ticker TEXT,
-      purchased_company TEXT,
-      insider_name TEXT,
-      insider_title TEXT,
-      shares NUMERIC,
-      price_per_share NUMERIC,
-      total_value NUMERIC,
-      transaction_date DATE,
-      signal_score NUMERIC,
-      purchase_type TEXT,
-      raw JSONB,
-      created_at TIMESTAMPTZ DEFAULT now(),
-      updated_at TIMESTAMPTZ DEFAULT now()
+      id TEXT PRIMARY KEY
     );
   `);
 
-  await client.query(`
-    CREATE TABLE IF NOT EXISTS ingestion_state (
-      key TEXT PRIMARY KEY,
-      value JSONB NOT NULL,
-      updated_at TIMESTAMPTZ DEFAULT now()
-    );
-  `);
+  // Ensure required columns exist
+  const alterTx = [
+    `ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS cik TEXT;`,
+    `ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS employer_ticker TEXT;`,
+    `ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS employer_company TEXT;`,
+    `ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS purchased_ticker TEXT;`,
+    `ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS purchased_company TEXT;`,
+    `ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS insider_name TEXT;`,
+    `ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS insider_title TEXT;`,
+    `ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS shares NUMERIC;`,
+    `ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS price_per_share NUMERIC;`,
+    `ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS total_value NUMERIC;`,
+    `ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS transaction_date DATE;`,
+    `ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS signal_score NUMERIC;`,
+    `ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS purchase_type TEXT;`,
+    `ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS raw JSONB;`,
+    `ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now();`,
+    `ALTER TABLE insider_transactions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();`,
+  ];
+  for (const q of alterTx) await client.query(q);
 
-  // Handy index for drilldowns
+  // Indexes
   await client.query(`
     CREATE INDEX IF NOT EXISTS idx_insider_tx_purchased_ticker_date
     ON insider_transactions(purchased_ticker, transaction_date DESC);
@@ -91,26 +93,43 @@ async function ensureSchema(client) {
     CREATE INDEX IF NOT EXISTS idx_insider_tx_insider_date
     ON insider_transactions(insider_name, transaction_date DESC);
   `);
+
+  // --- Ingestion state (match what your /api/migrate shows: id + value)
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS ingestion_state (
+      id TEXT PRIMARY KEY,
+      value JSONB,
+      updated_at TIMESTAMPTZ DEFAULT now()
+    );
+  `);
+
+  // If Neon integration created a fancier ingestion_state, these will just no-op if already present
+  await client.query(`ALTER TABLE ingestion_state ADD COLUMN IF NOT EXISTS id TEXT;`);
+  await client.query(`ALTER TABLE ingestion_state ADD COLUMN IF NOT EXISTS value JSONB;`);
+  await client.query(`ALTER TABLE ingestion_state ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();`);
+
+  // Ensure primary key on id (safe-ish)
+  // If a PK already exists, this may throw; so wrap it.
+  try {
+    await client.query(`ALTER TABLE ingestion_state ADD CONSTRAINT ingestion_state_pkey PRIMARY KEY (id);`);
+  } catch {}
 }
 
-async function getState(client, key) {
-  const r = await client.query(
-    `SELECT value FROM ingestion_state WHERE key=$1`,
-    [key]
-  );
+async function getState(client, id) {
+  const r = await client.query(`SELECT value FROM ingestion_state WHERE id=$1`, [id]);
   return r.rows?.[0]?.value ?? null;
 }
 
-async function setState(client, key, value) {
+async function setState(client, id, value) {
   await client.query(
     `
-    INSERT INTO ingestion_state(key, value, updated_at)
+    INSERT INTO ingestion_state(id, value, updated_at)
     VALUES($1, $2::jsonb, now())
-    ON CONFLICT (key) DO UPDATE
+    ON CONFLICT (id) DO UPDATE
       SET value = EXCLUDED.value,
           updated_at = now()
-  `,
-    [key, JSON.stringify(value)]
+    `,
+    [id, JSON.stringify(value)]
   );
 }
 
@@ -129,27 +148,20 @@ async function statusResponse(client) {
     }
   }
 
-  const cursor = await getState(client, "insider_buys_cursor");
-  const lastRun = await getState(client, "ingest_last_run");
-
   return {
     ok: true,
     tables: tables.rows.map((r) => r.table_name),
     counts,
-    cursor,
-    lastRun,
+    cursor: await getState(client, "insider_buys_cursor"),
+    lastRun: await getState(client, "ingest_last_run"),
     ts: nowIso(),
   };
 }
 
-async function fetchInsiderBuysFromSelf(req, {
-  pageSize,
-  page,
-  days,
-  mode,
-  includeGroups,
-  debug,
-} = {}) {
+async function fetchInsiderBuysFromSelf(
+  req,
+  { pageSize, page, days, mode, includeGroups } = {}
+) {
   const base = getBaseUrl(req);
   const url =
     `${base}/api/insider-buys?wrap=1` +
@@ -157,32 +169,24 @@ async function fetchInsiderBuysFromSelf(req, {
     `&page=${encodeURIComponent(page)}` +
     `&days=${encodeURIComponent(days)}` +
     (mode === "seed" ? `&mode=seed` : ``) +
-    (includeGroups ? `&includeGroups=1` : ``) +
-    (debug ? `&debug=1` : ``);
+    (includeGroups ? `&includeGroups=1` : ``);
 
-  const r = await fetch(url, {
-    method: "GET",
-    headers: { Accept: "application/json" },
-  });
-
+  const r = await fetch(url, { method: "GET", headers: { Accept: "application/json" } });
   if (!r.ok) {
     const txt = await r.text().catch(() => "");
-    throw new Error(`insider-buys HTTP ${r.status} ${txt}`.slice(0, 500));
+    throw new Error(`insider-buys HTTP ${r.status} ${txt}`.slice(0, 800));
   }
 
   const payload = await r.json();
-
-  // expected: { data: [], meta: {...}, groups?: [] }
   const data = Array.isArray(payload) ? payload : payload?.data;
   const meta = Array.isArray(payload) ? null : payload?.meta;
 
-  return { url, data: Array.isArray(data) ? data : [], meta, payload };
+  return { url, data: Array.isArray(data) ? data : [], meta };
 }
 
 async function upsertBatch(client, rows) {
-  let inserted = 0;
+  let upserts = 0;
 
-  // Upsert transactions
   for (const item of rows) {
     const id = String(item.id ?? "");
     if (!id) continue;
@@ -192,7 +196,7 @@ async function upsertBatch(client, rows) {
     const employerTicker = item.employerTicker ? String(item.employerTicker) : null;
     const employerCompany = item.employerCompany ? String(item.employerCompany) : null;
 
-    // best-effort CIK
+    // Note: your current insider-buys payload might not include cik — that's okay
     const cik = item.cik ? String(item.cik) : null;
 
     await client.query(
@@ -250,7 +254,7 @@ async function upsertBatch(client, rows) {
       ]
     );
 
-    // Upsert company record (best-effort)
+    // Upsert companies best-effort if cik exists
     if (cik) {
       await client.query(
         `
@@ -265,14 +269,13 @@ async function upsertBatch(client, rows) {
       );
     }
 
-    inserted += 1;
+    upserts += 1;
   }
 
-  return inserted;
+  return upserts;
 }
 
 export default async function handler(req, res) {
-  // allow GET for ease of use (and browser testing)
   if (req.method !== "GET" && req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" });
   }
@@ -284,11 +287,11 @@ export default async function handler(req, res) {
   const mode = String(req.query.mode || "status"); // status | run | backfill
   const dryRun = bool(req.query.dryRun, false);
 
-  // knobs to avoid 429 + timeouts
-  const pageSize = num(req.query.pageSize, 50);        // how many rows per page from insider-buys
-  const maxPages = num(req.query.maxPages, 3);         // pages per invocation
-  const throttleMs = num(req.query.throttleMs, 600);   // sleep between pages
+  const pageSize = num(req.query.pageSize, 50);
+  const maxPages = num(req.query.maxPages, 3);
+  const throttleMs = num(req.query.throttleMs, 600);
   const days = num(req.query.days, 30);
+
   const dataMode = String(req.query.dataMode || "live"); // live | seed
   const includeGroups = bool(req.query.includeGroups, true);
 
@@ -297,167 +300,82 @@ export default async function handler(req, res) {
   try {
     await ensureSchema(client);
 
-    // STATUS
     if (mode === "status") {
-      const out = await statusResponse(client);
-      return res.status(200).json(out);
+      return res.status(200).json(await statusResponse(client));
     }
 
-    // RUN (incremental)
-    // Uses a cursor stored in ingestion_state to continue where it left off.
-    if (mode === "run") {
-      const cursorKey = "insider_buys_cursor";
-      const existing = (await getState(client, cursorKey)) || {};
-      const startPage = num(req.query.page, existing.page || 1);
+    if (mode !== "run" && mode !== "backfill") {
+      return res.status(400).json({ error: "Unknown mode", allowed: ["status", "run", "backfill"] });
+    }
 
-      let page = startPage;
-      let totalFetched = 0;
-      let totalInserted = 0;
-      let lastUrl = null;
+    const cursorId = mode === "backfill" ? "insider_buys_backfill_cursor" : "insider_buys_cursor";
+    const existingCursor = (await getState(client, cursorId)) || {};
+    const startPage = num(req.query.page, existingCursor.page || 1);
 
-      const startedAt = Date.now();
+    let page = startPage;
+    let fetched = 0;
+    let inserted = 0;
+    let lastUrl = null;
 
-      for (let i = 0; i < maxPages; i++) {
-        const { url, data, meta } = await fetchInsiderBuysFromSelf(req, {
-          pageSize,
-          page,
-          days,
-          mode: dataMode,
-          includeGroups,
-          debug: false,
-        });
+    const startedAt = Date.now();
 
-        lastUrl = url;
-        totalFetched += data.length;
-
-        if (!dryRun && data.length) {
-          const ins = await upsertBatch(client, data);
-          totalInserted += ins;
-        }
-
-        // save cursor after each page
-        await setState(client, cursorKey, {
-          page: page + 1,
-          pageSize,
-          days,
-          dataMode,
-          updatedAt: nowIso(),
-          lastMeta: meta || null,
-        });
-
-        // stop early if no rows
-        if (data.length === 0) break;
-
-        page += 1;
-        if (throttleMs > 0) await sleep(throttleMs);
-
-        // guardrails for serverless execution time
-        if (Date.now() - startedAt > 22_000) break;
-      }
-
-      const runInfo = {
-        ok: true,
-        mode: "run",
-        dryRun,
-        fetched: totalFetched,
-        inserted: totalInserted,
-        cursor: await getState(client, cursorKey),
-        lastUrl,
-        ts: nowIso(),
-      };
-
-      await setState(client, "ingest_last_run", {
-        ...runInfo,
-        finishedAt: nowIso(),
+    for (let i = 0; i < maxPages; i++) {
+      const { url, data, meta } = await fetchInsiderBuysFromSelf(req, {
+        pageSize,
+        page,
+        days,
+        mode: dataMode,
+        includeGroups,
       });
 
-      return res.status(200).json(runInfo);
-    }
+      lastUrl = url;
+      fetched += data.length;
 
-    // BACKFILL (manual only)
-    // Runs the same paged ingestion but you can crank up days + pages intentionally.
-    if (mode === "backfill") {
-      // recommended: call manually with days=365&maxPages=10&pageSize=100&throttleMs=900
-      const cursorKey = "insider_buys_backfill_cursor";
-      const existing = (await getState(client, cursorKey)) || {};
-      const startPage = num(req.query.page, existing.page || 1);
-
-      let page = startPage;
-      let totalFetched = 0;
-      let totalInserted = 0;
-      let lastUrl = null;
-
-      const startedAt = Date.now();
-
-      for (let i = 0; i < maxPages; i++) {
-        const { url, data, meta } = await fetchInsiderBuysFromSelf(req, {
-          pageSize,
-          page,
-          days,
-          mode: dataMode,
-          includeGroups,
-          debug: false,
-        });
-
-        lastUrl = url;
-        totalFetched += data.length;
-
-        if (!dryRun && data.length) {
-          const ins = await upsertBatch(client, data);
-          totalInserted += ins;
-        }
-
-        await setState(client, cursorKey, {
-          page: page + 1,
-          pageSize,
-          days,
-          dataMode,
-          updatedAt: nowIso(),
-          lastMeta: meta || null,
-        });
-
-        if (data.length === 0) break;
-
-        page += 1;
-        if (throttleMs > 0) await sleep(throttleMs);
-
-        if (Date.now() - startedAt > 22_000) break;
+      if (!dryRun && data.length) {
+        inserted += await upsertBatch(client, data);
       }
 
-      const out = {
-        ok: true,
-        mode: "backfill",
-        dryRun,
-        fetched: totalFetched,
-        inserted: totalInserted,
-        cursor: await getState(client, cursorKey),
-        lastUrl,
-        ts: nowIso(),
-        hint:
-          "Backfill is meant to be called repeatedly. Keep calling until fetched stops increasing / page returns 0 rows.",
-      };
-
-      await setState(client, "ingest_last_run", {
-        ...out,
-        finishedAt: nowIso(),
+      // cursor advance
+      await setState(client, cursorId, {
+        page: page + 1,
+        pageSize,
+        days,
+        dataMode,
+        updatedAt: nowIso(),
+        lastMeta: meta || null,
       });
 
-      return res.status(200).json(out);
+      if (data.length === 0) break;
+
+      page += 1;
+      if (throttleMs > 0) await sleep(throttleMs);
+
+      // stay under typical serverless execution time
+      if (Date.now() - startedAt > 22_000) break;
     }
 
-    return res.status(400).json({
-      error: "Unknown mode",
-      allowed: ["status", "run", "backfill"],
-    });
+    const out = {
+      ok: true,
+      mode,
+      dryRun,
+      fetched,
+      inserted,
+      cursor: await getState(client, cursorId),
+      lastUrl,
+      ts: nowIso(),
+      hint:
+        mode === "backfill"
+          ? "Call backfill repeatedly (same URL) until fetched stops increasing / pages return 0 rows."
+          : "Run is incremental. Call periodically to keep DB fresh.",
+    };
+
+    await setState(client, "ingest_last_run", { ...out, finishedAt: nowIso() });
+
+    return res.status(200).json(out);
   } catch (err) {
     const msg = err?.message || String(err);
     try {
-      await setState(client, "ingest_last_run", {
-        ok: false,
-        mode,
-        error: msg,
-        ts: nowIso(),
-      });
+      await setState(client, "ingest_last_run", { ok: false, mode, error: msg, ts: nowIso() });
     } catch {}
     return res.status(500).json({ error: "Ingest error", details: msg });
   } finally {
