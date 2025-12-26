@@ -1,95 +1,92 @@
 // /api/insider-buys.js
-// Global Form 4 insider BUY parser (debug-friendly)
+// Vercel-safe Form 4 BUY parser using SEC submissions API
+
+const HEADERS = {
+  "User-Agent": "InsiderScope (contact: you@example.com)",
+  Accept: "application/json",
+};
+
+// High-volume companies to prove data pipe works
+const CIKS = [
+  "0000320193", // Apple
+  "0000789019", // Microsoft
+  "0001652044", // Alphabet
+  "0001018724", // Amazon
+  "0001318605", // Tesla
+];
 
 export default async function handler(req, res) {
   try {
-    const LOOKBACK_DAYS = 90;
-    const now = new Date();
-    const cutoff = new Date(now.getTime() - LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
-
-    const indexUrl = "https://data.sec.gov/submissions/CIK0000000000.json";
-
-    // SEC index of recent filings
-    const feedRes = await fetch(
-      "https://data.sec.gov/api/xbrl/companyfacts/CIK0000320193.json",
-      {
-        headers: {
-          "User-Agent": "InsiderScope (contact: you@example.com)",
-          Accept: "application/json",
-        },
-      }
-    );
-
-    // Use daily master index instead (simpler + reliable)
-    const masterRes = await fetch(
-      "https://www.sec.gov/Archives/edgar/daily-index/master.idx",
-      {
-        headers: {
-          "User-Agent": "InsiderScope (contact: you@example.com)",
-        },
-      }
-    );
-
-    const text = await masterRes.text();
-    const lines = text.split("\n").slice(11); // skip header
-
     const results = [];
 
-    for (const line of lines) {
-      if (!line.includes("|4|")) continue;
+    for (const cik of CIKS) {
+      const padded = cik.padStart(10, "0");
 
-      const parts = line.split("|");
-      const cik = parts[0];
-      const date = new Date(parts[3]);
-      const path = parts[4];
+      const submissionsUrl = `https://data.sec.gov/submissions/CIK${padded}.json`;
+      const subRes = await fetch(submissionsUrl, { headers: HEADERS });
 
-      if (date < cutoff) continue;
+      if (!subRes.ok) continue;
 
-      const xmlUrl = `https://www.sec.gov/Archives/${path.replace(
-        ".txt",
-        "/primary_doc.xml"
-      )}`;
+      const subData = await subRes.json();
+      const recent = subData.filings?.recent;
+      if (!recent) continue;
 
-      const xmlRes = await fetch(xmlUrl, {
-        headers: {
-          "User-Agent": "InsiderScope (contact: you@example.com)",
-          Accept: "application/xml",
-        },
-      });
+      const count = recent.form.length;
 
-      if (!xmlRes.ok) continue;
+      for (let i = 0; i < count; i++) {
+        if (recent.form[i] !== "4") continue;
 
-      const xml = await xmlRes.text();
+        const accession = recent.accessionNumber[i].replace(/-/g, "");
+        const filingDate = recent.filingDate[i];
+        const baseUrl = `https://www.sec.gov/Archives/edgar/data/${parseInt(
+          cik,
+          10
+        )}/${accession}`;
 
-      if (!xml.includes("<transactionCode>P</transactionCode>")) continue;
+        const xmlUrl = `${baseUrl}/${recent.primaryDocument[i]}`;
 
-      const get = (tag) => {
-        const m = xml.match(new RegExp(`<${tag}>(.*?)</${tag}>`));
-        return m ? m[1] : null;
-      };
+        const xmlRes = await fetch(xmlUrl, {
+          headers: {
+            "User-Agent": HEADERS["User-Agent"],
+            Accept: "application/xml",
+          },
+        });
 
-      const shares = parseFloat(get("transactionShares")) || 0;
-      const price = parseFloat(get("transactionPricePerShare")) || 0;
+        if (!xmlRes.ok) continue;
 
-      results.push({
-        cik,
-        companyName: get("issuerName") || "Unknown",
-        ticker: get("issuerTradingSymbol") || "—",
-        insiderName: get("rptOwnerName") || "Unknown",
-        insiderTitle: get("officerTitle") || "Insider",
-        shares,
-        pricePerShare: price,
-        totalValue: shares * price,
-        transactionDate: get("transactionDate") || parts[3],
-      });
+        const xml = await xmlRes.text();
 
-      if (results.length >= 25) break; // safety limit
+        // Only BUY transactions
+        if (!xml.includes("<transactionCode>P</transactionCode>")) continue;
+
+        const get = (tag) => {
+          const m = xml.match(new RegExp(`<${tag}>(.*?)</${tag}>`));
+          return m ? m[1] : null;
+        };
+
+        const shares = parseFloat(get("transactionShares")) || 0;
+        const price = parseFloat(get("transactionPricePerShare")) || 0;
+
+        results.push({
+          cik,
+          company: get("issuerName"),
+          ticker: get("issuerTradingSymbol"),
+          insider: get("rptOwnerName"),
+          title: get("officerTitle") || "Insider",
+          shares,
+          price,
+          value: shares * price,
+          date: filingDate,
+        });
+
+        if (results.length >= 20) break;
+      }
     }
 
     res.status(200).json(results);
   } catch (err) {
     res.status(500).json({
-      error: "Failed to fetch Form 4 data",
+      error: "Backend failure",
       message: err.message,
     });
   }
