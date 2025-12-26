@@ -108,62 +108,6 @@ function valueField(node) {
   return node;
 }
 
-function collectFootnoteAndRemarksText(root) {
-  const texts = [];
-
-  // remarks can be string or { value: ... }
-  const remarks =
-    safeText(valueField(root?.remarks)) ||
-    safeText(valueField(root?.remarks?.value)) ||
-    "";
-  if (remarks) texts.push(remarks);
-
-  // footnotes: can be nested
-  const footnoteNodes = [];
-  // common
-  footnoteNodes.push(...ensureArray(root?.footnotes?.footnote));
-  // fallback deep search
-  const deep = deepFindAll(root, "footnote");
-  for (const d of deep) footnoteNodes.push(...ensureArray(d));
-
-  for (const fn of footnoteNodes) {
-    if (!fn) continue;
-    // fn can be string, object, array
-    if (typeof fn === "string") {
-      const t = safeText(fn);
-      if (t) texts.push(t);
-      continue;
-    }
-    // some are like { value: "..." } or { "#text": "..." } or mixed
-    const candidates = [
-      fn?.value,
-      fn?.text,
-      fn?.["#text"],
-      fn?.["$text"],
-      fn,
-    ];
-    for (const c of candidates) {
-      const t = safeText(typeof c === "object" ? "" : c);
-      if (t) texts.push(t);
-    }
-  }
-
-  return texts.join(" \n");
-}
-
-function looksScheduled(footnotesAndRemarks) {
-  const s = safeText(footnotesAndRemarks).toLowerCase();
-  if (!s) return false;
-  // best-effort heuristics
-  return (
-    s.includes("10b5-1") ||
-    s.includes("10b5 1") ||
-    s.includes("rule 10b5") ||
-    s.includes("10b5 plan") ||
-    s.includes("trading plan")
-  );
-}
-
 function parseForm4Purchases(xmlTextRaw, debugCapture = null) {
   const xmlText = stripNamespaces(xmlTextRaw);
   const parser = new XMLParser({
@@ -201,9 +145,6 @@ function parseForm4Purchases(xmlTextRaw, debugCapture = null) {
     safeText(root?.officerTitle) ||
     "";
 
-  const notesText = collectFootnoteAndRemarksText(root);
-  const isScheduled = looksScheduled(notesText);
-
   let txs =
     root?.nonDerivativeTable?.nonDerivativeTransaction ??
     root?.nonDerivativeTransaction ??
@@ -228,7 +169,6 @@ function parseForm4Purchases(xmlTextRaw, debugCapture = null) {
     }
     debugCapture.nonDerivCount = txs.length;
     debugCapture.codes = codes;
-    debugCapture.isScheduled = isScheduled;
   }
 
   const purchases = [];
@@ -262,8 +202,6 @@ function parseForm4Purchases(xmlTextRaw, debugCapture = null) {
 
     if (!Number.isFinite(shares) || !Number.isFinite(price)) continue;
 
-    const totalValue = Math.round(shares * price);
-
     purchases.push({
       issuerTradingSymbol,
       issuerName,
@@ -272,8 +210,7 @@ function parseForm4Purchases(xmlTextRaw, debugCapture = null) {
       shares,
       pricePerShare: price,
       transactionDate: date,
-      totalValue,
-      isScheduled,
+      totalValue: Math.round(shares * price),
     });
   }
 
@@ -288,7 +225,7 @@ async function fetchAtomPage({ start, headers }) {
   return { resp, url };
 }
 
-// Demo/seed data
+// Seed rows — includes at least one cluster (multiple insiders buying same ticker)
 function seedRows() {
   const today = new Date();
   const daysAgo = (n) => {
@@ -298,22 +235,7 @@ function seedRows() {
   };
 
   return [
-    {
-      id: "cook-nke-2025-12-22",
-      insiderName: "Timothy D. Cook",
-      insiderTitle: "CEO",
-      employerTicker: "AAPL",
-      employerCompany: "Apple Inc.",
-      purchasedTicker: "NKE",
-      purchasedCompany: "Nike Inc.",
-      shares: 50000,
-      pricePerShare: 103.25,
-      totalValue: 5162500,
-      transactionDate: "2025-12-22",
-      signalScore: 92,
-      purchaseType: "external",
-      isScheduled: false,
-    },
+    // Cluster example: MSFT has 2 insiders buying within window
     {
       id: "nadella-msft-2025-12-21",
       insiderName: "Satya Nadella",
@@ -325,26 +247,41 @@ function seedRows() {
       shares: 25000,
       pricePerShare: 412.15,
       totalValue: 10303750,
-      transactionDate: "2025-12-21",
+      transactionDate: daysAgo(5),
       signalScore: 88,
       purchaseType: "own-company",
-      isScheduled: false,
     },
     {
-      id: "demo-1",
-      insiderName: "Jane Doe",
+      id: "hood-msft-2025-12-20",
+      insiderName: "Amy Hood",
       insiderTitle: "CFO",
-      employerTicker: "DEMO",
-      employerCompany: "Demo Holdings",
-      purchasedTicker: "DEMO",
-      purchasedCompany: "Demo Holdings",
-      shares: 12000,
-      pricePerShare: 27.4,
-      totalValue: 328800,
-      transactionDate: daysAgo(4),
-      signalScore: 74,
+      employerTicker: "MSFT",
+      employerCompany: "Microsoft Corp.",
+      purchasedTicker: "MSFT",
+      purchasedCompany: "Microsoft Corp.",
+      shares: 8000,
+      pricePerShare: 408.0,
+      totalValue: 3264000,
+      transactionDate: daysAgo(6),
+      signalScore: 82,
       purchaseType: "own-company",
-      isScheduled: false,
+    },
+
+    // Other sample rows
+    {
+      id: "cook-nke-2025-12-22",
+      insiderName: "Timothy D. Cook",
+      insiderTitle: "CEO",
+      employerTicker: "AAPL",
+      employerCompany: "Apple Inc.",
+      purchasedTicker: "NKE",
+      purchasedCompany: "Nike Inc.",
+      shares: 50000,
+      pricePerShare: 103.25,
+      totalValue: 5162500,
+      transactionDate: daysAgo(4),
+      signalScore: 92,
+      purchaseType: "external",
     },
     {
       id: "demo-2",
@@ -360,7 +297,6 @@ function seedRows() {
       transactionDate: daysAgo(9),
       signalScore: 67,
       purchaseType: "own-company",
-      isScheduled: true, // example scheduled flag
     },
     {
       id: "demo-3",
@@ -376,71 +312,85 @@ function seedRows() {
       transactionDate: daysAgo(12),
       signalScore: 59,
       purchaseType: "own-company",
-      isScheduled: false,
     },
   ];
 }
 
-function buildGroups(rows) {
-  // Group “multiple execs buying same company”
-  // We focus on: own-company purchases, NOT scheduled, totalValue > 0
-  const m = new Map();
+// Groups (“Company Clusters”) computed from returned rows
+function computeGroups(rows) {
+  // “Best-effort excluding scheduled buys” (we don't have 10b5-1 reliably here),
+  // but we can exclude obvious non-buys / exercises:
+  const eligible = rows.filter((r) => {
+    const type = safeText(r.purchaseType).toLowerCase();
+    const price = Number(r.pricePerShare ?? 0);
+    const shares = Number(r.shares ?? 0);
+    // exclude option exercises / zero-priced lines
+    if (type.includes("option") || type.includes("exercise")) return false;
+    if (!(price > 0) || !(shares > 0)) return false;
+    return true;
+  });
 
-  for (const r of rows) {
-    const sym = safeText(r.purchasedTicker || "");
-    if (!sym) continue;
+  const byTicker = new Map();
 
-    const purchaseType = safeText(r.purchaseType || "");
-    const isScheduled = !!r.isScheduled;
+  for (const r of eligible) {
+    const t = safeText(r.purchasedTicker || r.employerTicker);
+    if (!t) continue;
 
-    // “non scheduled purchases” heuristic:
-    if (purchaseType !== "own-company") continue;
-    if (isScheduled) continue;
-    if (!Number.isFinite(Number(r.totalValue)) || Number(r.totalValue) <= 0) continue;
-
-    const key = sym.toUpperCase();
-    if (!m.has(key)) {
-      m.set(key, {
-        purchasedTicker: key,
-        purchasedCompany: safeText(r.purchasedCompany || r.employerCompany || ""),
-        execCount: 0,
-        uniqueInsiders: new Set(),
-        totalValue: 0,
-        latestDate: safeText(r.transactionDate || ""),
+    const key = t.toUpperCase();
+    if (!byTicker.has(key)) {
+      byTicker.set(key, {
+        ticker: key,
+        company: safeText(r.purchasedCompany || r.employerCompany || ""),
         insiders: [],
+        insiderSet: new Set(),
+        totalValue: 0,
+        latestDate: "",
       });
     }
 
-    const g = m.get(key);
-    const insider = safeText(r.insiderName || "—");
-
-    if (!g.uniqueInsiders.has(insider)) {
-      g.uniqueInsiders.add(insider);
-      g.insiders.push({
-        insiderName: insider,
-        insiderTitle: safeText(r.insiderTitle || ""),
-        totalValue: Number(r.totalValue) || 0,
-        transactionDate: safeText(r.transactionDate || ""),
-      });
+    const g = byTicker.get(key);
+    const name = safeText(r.insiderName);
+    if (name && !g.insiderSet.has(name)) {
+      g.insiderSet.add(name);
     }
 
-    g.totalValue += Number(r.totalValue) || 0;
+    g.insiders.push({
+      insiderName: name || "—",
+      insiderTitle: safeText(r.insiderTitle) || "—",
+      value: Number(r.totalValue ?? 0),
+      date: safeText(r.transactionDate) || "",
+      purchaseType: safeText(r.purchaseType) || "",
+    });
 
-    const dt = safeText(r.transactionDate || "");
+    g.totalValue += Number(r.totalValue ?? 0);
+
+    const dt = safeText(r.transactionDate);
     if (dt && (!g.latestDate || dt > g.latestDate)) g.latestDate = dt;
   }
 
-  const groups = Array.from(m.values()).map((g) => {
-    g.execCount = g.uniqueInsiders.size;
-    delete g.uniqueInsiders;
-    // sort insider list by value desc
-    g.insiders.sort((a, b) => (b.totalValue || 0) - (a.totalValue || 0));
-    return g;
-  });
+  const groups = [];
+  for (const [, g] of byTicker) {
+    const insiderCount = g.insiderSet.size;
+    if (insiderCount < 2) continue; // requires multiple insiders
 
-  // Rank: more execs first, then bigger $ value
+    // keep top insider lines (largest value)
+    const insidersSorted = g.insiders
+      .slice()
+      .sort((a, b) => (b.value || 0) - (a.value || 0))
+      .slice(0, 6);
+
+    groups.push({
+      ticker: g.ticker,
+      company: g.company || "—",
+      insiderCount,
+      totalValue: Math.round(g.totalValue),
+      latestDate: g.latestDate || "",
+      insiders: insidersSorted,
+    });
+  }
+
   groups.sort((a, b) => {
-    if (b.execCount !== a.execCount) return b.execCount - a.execCount;
+    if (b.insiderCount !== a.insiderCount) return b.insiderCount - a.insiderCount;
     return (b.totalValue || 0) - (a.totalValue || 0);
   });
 
@@ -460,25 +410,29 @@ export default async function handler(req, res) {
   }
 
   const debug = String(req.query.debug || "") === "1";
-  const mode = safeText(req.query.mode || ""); // "seed"
-  const v = safeText(req.query.v || "");
   const wrap = String(req.query.wrap || "") === "1";
   const includeGroups = String(req.query.includeGroups || "") === "1";
+  const mode = safeText(req.query.mode || ""); // "seed" to force demo
+  const v = safeText(req.query.v || ""); // cache buster
 
+  // Pagination (used only when wrap=1)
   const pageSize = clamp(toInt(req.query.pageSize, 50), 1, 100);
-  const page = clamp(toInt(req.query.page, 1), 1, 500);
-  const offset = (page - 1) * pageSize;
+  const page = clamp(toInt(req.query.page, 1), 1, 1000);
 
+  // If old clients pass limit/days:
+  const limit = clamp(toInt(req.query.limit, pageSize), 1, 100);
   const days = clamp(toInt(req.query.days, 30), 1, 365);
-  const pages = clamp(toInt(req.query.pages, 2), 1, 3);
-  const scanCap = clamp(toInt(req.query.scan, 35), 10, 60);
-  const betweenCallsMs = clamp(toInt(req.query.throttle, 350), 200, 900);
-  const TIME_BUDGET_MS = clamp(toInt(req.query.budget, 6000), 2500, 9000);
 
+  // Live scan caps (serverless friendly)
+  const pages = clamp(toInt(req.query.pages, 2), 1, 3);
+  const scanCap = clamp(toInt(req.query.scan, 35), 10, 80);
+  const betweenCallsMs = clamp(toInt(req.query.throttle, 350), 200, 900);
+
+  const TIME_BUDGET_MS = clamp(toInt(req.query.budget, 6000), 2500, 9000);
   const startedAt = Date.now();
   const timeLeft = () => TIME_BUDGET_MS - (Date.now() - startedAt);
 
-  const cacheKey = `wrap=${wrap}|includeGroups=${includeGroups}|pageSize=${pageSize}|page=${page}|days=${days}|pages=${pages}|scan=${scanCap}|throttle=${betweenCallsMs}|budget=${TIME_BUDGET_MS}|mode=${mode}|v=${v}`;
+  const cacheKey = `wrap=${wrap}|groups=${includeGroups}|page=${page}|pageSize=${pageSize}|limit=${limit}|days=${days}|pages=${pages}|scan=${scanCap}|throttle=${betweenCallsMs}|mode=${mode}|v=${v}`;
   const now = Date.now();
   const cacheTtlMs = 5 * 60 * 1000;
 
@@ -486,13 +440,29 @@ export default async function handler(req, res) {
     return res.status(200).json(memCache.data);
   }
 
+  // Seed mode (fast)
   if (mode === "seed") {
     const all = seedRows();
-    const data = all.slice(offset, offset + pageSize);
-    const meta = { total: all.length, page, pageSize, offset, mode: "seed", source: "seed" };
-    const groups = includeGroups ? buildGroups(all) : undefined;
+    const total = all.length;
 
-    const payload = wrap ? { data, meta, ...(includeGroups ? { groups } : {}) } : data;
+    const slice = wrap
+      ? all.slice((page - 1) * pageSize, (page - 1) * pageSize + pageSize)
+      : all.slice(0, limit);
+
+    const payload = wrap
+      ? {
+          data: slice,
+          meta: {
+            total,
+            page,
+            pageSize,
+            offset: (page - 1) * pageSize,
+            mode: "seed",
+            source: "seed",
+          },
+          ...(includeGroups ? { groups: computeGroups(all) } : {}),
+        }
+      : slice;
 
     memCache.ts = Date.now();
     memCache.key = cacheKey;
@@ -513,10 +483,6 @@ export default async function handler(req, res) {
   const errorsSample = [];
   const samples = [];
   let entriesSeenTotal = 0;
-
-  // We collect more than one page worth so pagination has something to work with
-  // But keep it serverless-safe.
-  const desired = Math.min(200, offset + pageSize);
 
   for (let p = 0; p < pages; p++) {
     if (timeLeft() < 1200) break;
@@ -555,7 +521,7 @@ export default async function handler(req, res) {
       .slice(0, scanCap);
 
     for (let i = 0; i < recentEntries.length; i++) {
-      if (out.length >= desired) break;
+      if (out.length >= (wrap ? 100 : limit)) break; // keep bounded
       if (timeLeft() < 1200) break;
 
       const { linkHref, updated } = recentEntries[i];
@@ -623,59 +589,61 @@ export default async function handler(req, res) {
             transactionDate: dt,
             signalScore: 50,
             purchaseType: "own-company",
-            isScheduled: !!pch.isScheduled,
           });
 
-          if (out.length >= desired) break;
+          if (out.length >= (wrap ? 100 : limit)) break;
         }
       } catch (e) {
         errorsSample.push({ where: "loop", error: String(e) });
       }
     }
 
-    if (out.length >= desired) break;
+    if (out.length >= (wrap ? 100 : limit)) break;
   }
 
-  // If live returns nothing, use seed as fallback so UI doesn’t die
-  const allRows = out.length ? out : seedRows();
-  const data = allRows.slice(offset, offset + pageSize);
+  // If live found nothing, fallback to seed (keeps UI alive)
+  const liveReturned = out.length;
+  const allRows = liveReturned ? out : seedRows();
 
-  const meta = {
-    total: allRows.length,
-    page,
-    pageSize,
-    offset,
-    mode: "live",
-    source: out.length ? "live" : "fallback-seed",
-  };
+  // Final response shape
+  let payload;
+  if (wrap) {
+    const total = allRows.length;
+    const slice = allRows.slice((page - 1) * pageSize, (page - 1) * pageSize + pageSize);
 
-  const groups = includeGroups ? buildGroups(allRows) : undefined;
-
-  const payload = wrap
-    ? {
-        data,
-        meta,
-        ...(includeGroups ? { groups } : {}),
-        ...(debug
-          ? {
-              debug: {
-                cache: out.length ? "miss-fill" : "fallback-seed",
-                returnedLive: out.length,
-                totalServed: allRows.length,
-                entriesSeen: entriesSeenTotal,
-                cutoff: new Date(cutoff).toISOString(),
-                scanCap,
-                pages,
-                throttle: betweenCallsMs,
-                budget: TIME_BUDGET_MS,
-                timeSpentMs: Date.now() - startedAt,
-                errorsSample,
-                samples,
-              },
-            }
-          : {}),
-      }
-    : data;
+    payload = {
+      data: slice,
+      meta: {
+        total,
+        page,
+        pageSize,
+        offset: (page - 1) * pageSize,
+        mode: "live",
+        source: liveReturned ? "sec-live" : "fallback-seed",
+      },
+      ...(includeGroups ? { groups: computeGroups(allRows) } : {}),
+      ...(debug
+        ? {
+            debug: {
+              cache: liveReturned ? "miss-fill" : "fallback-seed",
+              returnedLive: liveReturned,
+              totalServed: allRows.length,
+              entriesSeen: entriesSeenTotal,
+              cutoff: new Date(cutoff).toISOString(),
+              scanCap,
+              pages,
+              throttle: betweenCallsMs,
+              budget: TIME_BUDGET_MS,
+              timeSpentMs: Date.now() - startedAt,
+              errorsSample,
+              samples,
+            },
+          }
+        : {}),
+    };
+  } else {
+    payload = allRows.slice(0, limit);
+  }
 
   memCache.ts = Date.now();
   memCache.key = cacheKey;
