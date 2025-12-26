@@ -41,7 +41,6 @@ export default async function handler(req, res) {
       const xml = await filingRes.text();
 
       // 4. Only BUY transactions (P)
-      if (!xml.includes("<transactionCode>P</transactionCode>")) continue;
 
       const get = (tag) => {
         const m = xml.match(new RegExp(`<${tag}>(.*?)</${tag}>`));
