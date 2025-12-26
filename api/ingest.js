@@ -1,3 +1,4 @@
+import crypto from "crypto";
 import { Pool } from "pg";
 
 const pool =
@@ -37,19 +38,65 @@ function getBaseUrl(req) {
   return `${proto}://${host}`;
 }
 
-async function ensureBaseTables(client) {
-  // companies table (keep it simple / compatible)
-  await client.query(`
-    CREATE TABLE IF NOT EXISTS companies (
-      cik TEXT PRIMARY KEY,
-      ticker TEXT,
-      company_name TEXT,
-      created_at TIMESTAMPTZ DEFAULT now(),
-      updated_at TIMESTAMPTZ DEFAULT now()
-    );
-  `);
+function sha1(s) {
+  return crypto.createHash("sha1").update(String(s)).digest("hex");
+}
 
-  // ingestion_state table (matches what your /api/migrate output shows)
+function normalizeTicker(t) {
+  if (!t) return null;
+  return String(t).trim().toUpperCase();
+}
+
+function pickCik(item) {
+  // Try a bunch of likely keys across your pipeline versions
+  const candidates = [
+    item.cik,
+    item.issuerCik,
+    item.employerCik,
+    item.companyCik,
+    item.raw?.cik,
+    item.raw?.issuerCik,
+    item.raw?.issuer?.cik,
+  ];
+  for (const c of candidates) {
+    const s = c === null || c === undefined ? "" : String(c).trim();
+    if (s) return s.padStart(10, "0"); // SEC CIK is often 10 digits
+  }
+  return null;
+}
+
+function computeTransactionId(item) {
+  // Prefer explicit IDs if present
+  const explicit =
+    item.transaction_id ||
+    item.transactionId ||
+    item.id ||
+    item.raw?.transaction_id ||
+    item.raw?.transactionId ||
+    item.raw?.id;
+
+  if (explicit) return String(explicit);
+
+  // Deterministic fallback (stable across runs)
+  const parts = [
+    pickCik(item) || "",
+    normalizeTicker(item.purchasedTicker) || normalizeTicker(item.employerTicker) || "",
+    item.insiderName || item.insider_name || "",
+    item.transactionDate || item.transaction_date || "",
+    item.filingDate || item.filing_date || "",
+    item.shares ?? "",
+    item.pricePerShare ?? item.price_per_share ?? "",
+    item.totalValue ?? item.total_value ?? "",
+    item.transactionCode || item.transaction_code || "",
+    item.sourceUrl || item.source_url || "",
+  ].map((x) => String(x).trim());
+
+  return sha1(parts.join("|"));
+}
+
+async function ensureSchema(client) {
+  // Keep this LIGHT: we don’t want to fight whatever you already created.
+  // Ensure ingestion_state exists with the schema your /api/migrate output shows.
   await client.query(`
     CREATE TABLE IF NOT EXISTS ingestion_state (
       id TEXT PRIMARY KEY,
@@ -62,55 +109,97 @@ async function ensureBaseTables(client) {
     );
   `);
 
-  // insider_transactions: DO NOT recreate if it exists; just ensure key columns exist.
-  // Your table already exists with many columns; we just ensure id exists for convenience.
+  // companies table (optional but helpful)
   await client.query(`
-    ALTER TABLE insider_transactions
-    ADD COLUMN IF NOT EXISTS id TEXT;
+    CREATE TABLE IF NOT EXISTS companies (
+      cik TEXT PRIMARY KEY,
+      ticker TEXT,
+      company_name TEXT,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      updated_at TIMESTAMPTZ DEFAULT now()
+    );
   `);
 
-  // Helpful indexes
+  // insider_transactions table: create only if missing.
+  // If you already have it, we won't try to redefine it here.
   await client.query(`
-    CREATE INDEX IF NOT EXISTS idx_insider_tx_ticker_date
-    ON insider_transactions(ticker, transaction_date DESC);
+    CREATE TABLE IF NOT EXISTS insider_transactions (
+      transaction_id TEXT PRIMARY KEY,
+      cik TEXT NOT NULL,
+      ticker TEXT,
+      company_name TEXT,
+      insider_name TEXT,
+      insider_title TEXT,
+      transaction_date DATE,
+      filing_date DATE,
+      shares NUMERIC,
+      price_per_share NUMERIC,
+      total_value NUMERIC,
+      transaction_code TEXT,
+      is_purchase BOOLEAN,
+      is_exercise BOOLEAN,
+      is_10b5_1 BOOLEAN,
+      accession_no TEXT,
+      source_url TEXT,
+      employer_ticker TEXT,
+      employer_company TEXT,
+      purchased_ticker TEXT,
+      purchased_company TEXT,
+      signal_score NUMERIC,
+      purchase_type TEXT,
+      raw JSONB,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      updated_at TIMESTAMPTZ DEFAULT now()
+    );
   `);
+
   await client.query(`
-    CREATE INDEX IF NOT EXISTS idx_insider_tx_purchased_ticker_date
+    CREATE INDEX IF NOT EXISTS idx_it_purchased_ticker_date
     ON insider_transactions(purchased_ticker, transaction_date DESC);
+  `);
+
+  await client.query(`
+    CREATE INDEX IF NOT EXISTS idx_it_insider_date
+    ON insider_transactions(insider_name, transaction_date DESC);
   `);
 }
 
 async function getState(client, id) {
-  const r = await client.query(`SELECT * FROM ingestion_state WHERE id=$1`, [id]);
+  const r = await client.query(
+    `SELECT id, cursor, last_run_at, status, last_error, value, updated_at
+     FROM ingestion_state WHERE id=$1`,
+    [id]
+  );
   return r.rows?.[0] ?? null;
 }
 
 async function setState(client, id, patch) {
-  // patch merges into value JSONB and updates columns if provided
   const current = await getState(client, id);
-  const nextValue = { ...(current?.value || {}), ...(patch.value || {}) };
+
+  const next = {
+    cursor: patch.cursor ?? current?.cursor ?? null,
+    last_run_at: patch.last_run_at ?? current?.last_run_at ?? null,
+    status: patch.status ?? current?.status ?? null,
+    last_error: patch.last_error ?? current?.last_error ?? null,
+    value: patch.value ?? current?.value ?? null,
+  };
 
   await client.query(
     `
     INSERT INTO ingestion_state(id, cursor, last_run_at, status, last_error, value, updated_at)
-    VALUES ($1, $2, $3, $4, $5, $6::jsonb, now())
+    VALUES($1, $2, $3, $4, $5, $6::jsonb, now())
     ON CONFLICT (id) DO UPDATE SET
-      cursor = COALESCE(EXCLUDED.cursor, ingestion_state.cursor),
-      last_run_at = COALESCE(EXCLUDED.last_run_at, ingestion_state.last_run_at),
-      status = COALESCE(EXCLUDED.status, ingestion_state.status),
-      last_error = COALESCE(EXCLUDED.last_error, ingestion_state.last_error),
+      cursor = EXCLUDED.cursor,
+      last_run_at = EXCLUDED.last_run_at,
+      status = EXCLUDED.status,
+      last_error = EXCLUDED.last_error,
       value = EXCLUDED.value,
       updated_at = now()
     `,
-    [
-      id,
-      patch.cursor ?? current?.cursor ?? null,
-      patch.last_run_at ?? current?.last_run_at ?? null,
-      patch.status ?? current?.status ?? null,
-      patch.last_error ?? current?.last_error ?? null,
-      JSON.stringify(nextValue),
-    ]
+    [id, next.cursor, next.last_run_at, next.status, next.last_error, JSON.stringify(next.value)]
   );
+
+  return getState(client, id);
 }
 
 async function statusResponse(client) {
@@ -128,30 +217,18 @@ async function statusResponse(client) {
     }
   }
 
-  const state = await getState(client, "insider_buys_ingest");
+  const state = await getState(client, "insider_buys");
 
   return {
     ok: true,
     tables: tables.rows.map((r) => r.table_name),
     counts,
-    state: state
-      ? {
-          cursor: state.cursor,
-          last_run_at: state.last_run_at,
-          status: state.status,
-          last_error: state.last_error,
-          value: state.value,
-          updated_at: state.updated_at,
-        }
-      : null,
+    state,
     ts: nowIso(),
   };
 }
 
-async function fetchInsiderBuysFromSelf(
-  req,
-  { pageSize, page, days, dataMode, includeGroups } = {}
-) {
+async function fetchInsiderBuysFromSelf(req, { pageSize, page, days, dataMode, includeGroups } = {}) {
   const base = getBaseUrl(req);
   const url =
     `${base}/api/insider-buys?wrap=1` +
@@ -161,43 +238,16 @@ async function fetchInsiderBuysFromSelf(
     (dataMode === "seed" ? `&mode=seed` : ``) +
     (includeGroups ? `&includeGroups=1` : ``);
 
-  const r = await fetch(url, { headers: { Accept: "application/json" } });
+  const r = await fetch(url, { method: "GET", headers: { Accept: "application/json" } });
+
   if (!r.ok) {
     const txt = await r.text().catch(() => "");
-    throw new Error(`insider-buys HTTP ${r.status} ${txt}`.slice(0, 800));
+    throw new Error(`insider-buys HTTP ${r.status} ${txt}`.slice(0, 500));
   }
 
   const payload = await r.json();
-  const data = payload?.data;
-  const meta = payload?.meta;
-
-  return { url, data: Array.isArray(data) ? data : [], meta: meta || null };
-}
-
-function coerceText(v) {
-  if (v === undefined || v === null) return null;
-  const s = String(v).trim();
-  return s.length ? s : null;
-}
-
-function coerceNum(v) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
-}
-
-function buildTransactionId(item) {
-  // Prefer item.id; otherwise build a stable fallback (best effort)
-  const id = coerceText(item?.id);
-  if (id) return id;
-
-  const acc = coerceText(item?.accessionNo) || coerceText(item?.accession_no);
-  const insider = coerceText(item?.insiderName);
-  const dt = coerceText(item?.transactionDate);
-  const ticker = coerceText(item?.purchasedTicker) || coerceText(item?.employerTicker);
-  if (acc && dt && (insider || ticker)) {
-    return `${acc}::${dt}::${insider || ""}::${ticker || ""}`.slice(0, 240);
-  }
-  return null;
+  const data = Array.isArray(payload) ? payload : payload?.data;
+  return { url, data: Array.isArray(data) ? data : [], payload };
 }
 
 async function upsertBatch(client, rows) {
@@ -205,104 +255,120 @@ async function upsertBatch(client, rows) {
   let skippedMissing = 0;
 
   for (const item of rows) {
-    const transaction_id = buildTransactionId(item);
-    const cik = coerceText(item?.cik);
-
-    // Your DB enforces NOT NULL on these; do not insert if missing.
-    if (!transaction_id || !cik) {
+    const cik = pickCik(item);
+    if (!cik) {
       skippedMissing += 1;
-      continue;
+      continue; // REQUIRED by your DB schema
     }
 
-    const purchased_ticker = coerceText(item?.purchasedTicker);
-    const purchased_company = coerceText(item?.purchasedCompany);
-    const employer_ticker = coerceText(item?.employerTicker);
-    const employer_company = coerceText(item?.employerCompany);
+    const transactionId = computeTransactionId(item);
 
-    const insider_name = coerceText(item?.insiderName);
-    const insider_title = coerceText(item?.insiderTitle);
+    const purchasedTicker = normalizeTicker(item.purchasedTicker);
+    const employerTicker = normalizeTicker(item.employerTicker);
 
-    const shares = coerceNum(item?.shares);
-    const price_per_share = coerceNum(item?.pricePerShare);
-    const total_value = coerceNum(item?.totalValue);
+    const purchasedCompany = item.purchasedCompany ? String(item.purchasedCompany) : null;
+    const employerCompany = item.employerCompany ? String(item.employerCompany) : null;
 
-    const transaction_date = coerceText(item?.transactionDate); // cast to date below
-    const signal_score = coerceNum(item?.signalScore);
-    const purchase_type = coerceText(item?.purchaseType);
+    const insiderName = item.insiderName ? String(item.insiderName) : (item.insider_name ? String(item.insider_name) : null);
+    const insiderTitle = item.insiderTitle ? String(item.insiderTitle) : (item.insider_title ? String(item.insider_title) : null);
 
-    // Insert into insider_transactions using your column names
+    const transactionDate = item.transactionDate ?? item.transaction_date ?? null;
+    const filingDate = item.filingDate ?? item.filing_date ?? null;
+
+    const shares = item.shares ?? null;
+    const pricePerShare = item.pricePerShare ?? item.price_per_share ?? null;
+    const totalValue = item.totalValue ?? item.total_value ?? null;
+
+    const signalScore = item.signalScore ?? item.signal_score ?? null;
+    const purchaseType = item.purchaseType ?? item.purchase_type ?? null;
+
     await client.query(
       `
-      INSERT INTO insider_transactions (
+      INSERT INTO insider_transactions(
         transaction_id,
         cik,
+        ticker,
+        company_name,
+        insider_name,
+        insider_title,
+        transaction_date,
+        filing_date,
+        shares,
+        price_per_share,
+        total_value,
         employer_ticker,
         employer_company,
         purchased_ticker,
         purchased_company,
-        insider_name,
-        insider_title,
-        shares,
-        price_per_share,
-        total_value,
-        transaction_date,
         signal_score,
         purchase_type,
         raw,
-        id,
         updated_at
       )
-      VALUES (
-        $1, $2,
-        $3, $4,
-        $5, $6,
-        $7, $8,
-        $9, $10, $11,
-        NULLIF($12,'')::date,
-        $13, $14,
-        $15::jsonb,
-        $16,
+      VALUES(
+        $1,
+        $2,
+        $3,
+        $4,
+        $5,
+        $6,
+        NULLIF($7,'')::date,
+        NULLIF($8,'')::date,
+        $9::numeric,
+        $10::numeric,
+        $11::numeric,
+        $12,
+        $13,
+        $14,
+        $15,
+        $16::numeric,
+        $17,
+        $18::jsonb,
         now()
       )
       ON CONFLICT (transaction_id) DO UPDATE SET
         cik = EXCLUDED.cik,
+        ticker = COALESCE(EXCLUDED.ticker, insider_transactions.ticker),
+        company_name = COALESCE(EXCLUDED.company_name, insider_transactions.company_name),
+        insider_name = COALESCE(EXCLUDED.insider_name, insider_transactions.insider_name),
+        insider_title = COALESCE(EXCLUDED.insider_title, insider_transactions.insider_title),
+        transaction_date = COALESCE(EXCLUDED.transaction_date, insider_transactions.transaction_date),
+        filing_date = COALESCE(EXCLUDED.filing_date, insider_transactions.filing_date),
+        shares = COALESCE(EXCLUDED.shares, insider_transactions.shares),
+        price_per_share = COALESCE(EXCLUDED.price_per_share, insider_transactions.price_per_share),
+        total_value = COALESCE(EXCLUDED.total_value, insider_transactions.total_value),
         employer_ticker = COALESCE(EXCLUDED.employer_ticker, insider_transactions.employer_ticker),
         employer_company = COALESCE(EXCLUDED.employer_company, insider_transactions.employer_company),
         purchased_ticker = COALESCE(EXCLUDED.purchased_ticker, insider_transactions.purchased_ticker),
         purchased_company = COALESCE(EXCLUDED.purchased_company, insider_transactions.purchased_company),
-        insider_name = COALESCE(EXCLUDED.insider_name, insider_transactions.insider_name),
-        insider_title = COALESCE(EXCLUDED.insider_title, insider_transactions.insider_title),
-        shares = COALESCE(EXCLUDED.shares, insider_transactions.shares),
-        price_per_share = COALESCE(EXCLUDED.price_per_share, insider_transactions.price_per_share),
-        total_value = COALESCE(EXCLUDED.total_value, insider_transactions.total_value),
-        transaction_date = COALESCE(EXCLUDED.transaction_date, insider_transactions.transaction_date),
         signal_score = COALESCE(EXCLUDED.signal_score, insider_transactions.signal_score),
         purchase_type = COALESCE(EXCLUDED.purchase_type, insider_transactions.purchase_type),
         raw = COALESCE(EXCLUDED.raw, insider_transactions.raw),
-        id = COALESCE(EXCLUDED.id, insider_transactions.id),
         updated_at = now()
       `,
       [
-        transaction_id,
+        transactionId,
         cik,
-        employer_ticker,
-        employer_company,
-        purchased_ticker,
-        purchased_company,
-        insider_name,
-        insider_title,
-        shares,
-        price_per_share,
-        total_value,
-        transaction_date,
-        signal_score,
-        purchase_type,
+        purchasedTicker || employerTicker,
+        purchasedCompany || employerCompany,
+        insiderName,
+        insiderTitle,
+        transactionDate ? String(transactionDate) : "",
+        filingDate ? String(filingDate) : "",
+        shares ?? null,
+        pricePerShare ?? null,
+        totalValue ?? null,
+        employerTicker,
+        employerCompany,
+        purchasedTicker,
+        purchasedCompany,
+        signalScore ?? null,
+        purchaseType ? String(purchaseType) : null,
         JSON.stringify(item),
-        coerceText(item?.id), // keep original id if present
       ]
     );
 
-    // Upsert companies (best effort)
+    // best-effort companies upsert
     await client.query(
       `
       INSERT INTO companies(cik, ticker, company_name, updated_at)
@@ -312,11 +378,7 @@ async function upsertBatch(client, rows) {
         company_name = COALESCE(EXCLUDED.company_name, companies.company_name),
         updated_at = now()
       `,
-      [
-        cik,
-        purchased_ticker || employer_ticker,
-        purchased_company || employer_company,
-      ]
+      [cik, purchasedTicker || employerTicker, purchasedCompany || employerCompany]
     );
 
     inserted += 1;
@@ -346,17 +408,20 @@ export default async function handler(req, res) {
   const client = await pool.connect();
 
   try {
-    await ensureBaseTables(client);
+    await ensureSchema(client);
 
     if (mode === "status") {
-      return res.status(200).json(await statusResponse(client));
+      const out = await statusResponse(client);
+      return res.status(200).json(out);
     }
 
-    const stateId = "insider_buys_ingest";
-    const state = (await getState(client, stateId)) || {};
-    const cursorObj = state.value?.cursor || {};
-
-    const startPage = num(req.query.page, cursorObj.page || 1);
+    // cursor lives in ingestion_state.id = 'insider_buys'
+    const state = (await getState(client, "insider_buys")) || {};
+    const startPage = num(req.query.page, (() => {
+      const c = state.cursor || "";
+      const m = String(c).match(/page=(\d+)/);
+      return m ? Number(m[1]) : 1;
+    })());
 
     let page = startPage;
     let fetched = 0;
@@ -366,15 +431,8 @@ export default async function handler(req, res) {
 
     const startedAt = Date.now();
 
-    await setState(client, stateId, {
-      status: "running",
-      last_error: null,
-      last_run_at: new Date(),
-      value: { cursor: { ...cursorObj, page: startPage } },
-    });
-
     for (let i = 0; i < maxPages; i++) {
-      const { url, data, meta } = await fetchInsiderBuysFromSelf(req, {
+      const { url, data } = await fetchInsiderBuysFromSelf(req, {
         pageSize,
         page,
         days,
@@ -389,13 +447,33 @@ export default async function handler(req, res) {
         const r = await upsertBatch(client, data);
         inserted += r.inserted;
         skippedMissing += r.skippedMissing;
+      } else if (data.length) {
+        // dryRun still counts how many would be skipped
+        for (const item of data) if (!pickCik(item)) skippedMissing += 1;
       }
 
-      // advance cursor
-      const nextCursor = { page: page + 1, pageSize, days, dataMode, lastMeta: meta || null };
-      await setState(client, stateId, {
-        cursor: JSON.stringify(nextCursor),
-        value: { cursor: nextCursor },
+      // advance cursor regardless (prevents infinite loop on “bad” page)
+      await setState(client, "insider_buys", {
+        cursor: `page=${page + 1}`,
+        last_run_at: new Date().toISOString(),
+        status: "ok",
+        last_error: null,
+        value: {
+          ts: nowIso(),
+          mode,
+          page,
+          nextPage: page + 1,
+          days,
+          dataMode,
+          pageSize,
+          maxPages,
+          throttleMs,
+          fetched,
+          inserted,
+          skippedMissing,
+          lastUrl,
+          dryRun,
+        },
       });
 
       if (data.length === 0) break;
@@ -403,21 +481,11 @@ export default async function handler(req, res) {
       page += 1;
       if (throttleMs > 0) await sleep(throttleMs);
 
-      // serverless guardrail
+      // keep serverless safe
       if (Date.now() - startedAt > 22_000) break;
     }
 
-    await setState(client, stateId, {
-      status: "ok",
-      last_error: null,
-      last_run_at: new Date(),
-      value: {
-        cursor: { page, pageSize, days, dataMode },
-        lastResult: { fetched, inserted, skippedMissing, dryRun, lastUrl },
-      },
-    });
-
-    return res.status(200).json({
+    const out = {
       ok: true,
       mode,
       dryRun,
@@ -427,14 +495,17 @@ export default async function handler(req, res) {
       nextPage: page,
       lastUrl,
       ts: nowIso(),
-    });
+    };
+
+    return res.status(200).json(out);
   } catch (err) {
     const msg = err?.message || String(err);
     try {
-      await setState(client, "insider_buys_ingest", {
+      await setState(client, "insider_buys", {
+        last_run_at: new Date().toISOString(),
         status: "error",
         last_error: msg,
-        last_run_at: new Date(),
+        value: { ts: nowIso(), mode, error: msg },
       });
     } catch {}
     return res.status(500).json({ error: "Ingest error", details: msg });
