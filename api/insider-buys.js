@@ -1,56 +1,89 @@
 export default async function handler(req, res) {
   try {
-    const LOOKBACK_DAYS = 7;
+    const LOOKBACK_DAYS = 7; // change to 365 later if you want
 
     const headers = {
-      "User-Agent": "InsiderScope research contact@example.com",
+      "User-Agent": "InsiderScope research app (contact@example.com)",
       "Accept-Encoding": "gzip, deflate",
     };
 
-    // 1. Get a small, known-good list of recent Form 4 filings
-    const recentFilingsUrl =
-      "https://data.sec.gov/submissions/CIK0000320193.json"; // Apple (stable, many filings)
+    const now = new Date();
+    const cutoff = new Date(now.getTime() - LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
 
-    const filingsResp = await fetch(recentFilingsUrl, { headers });
-    const filingsJson = await filingsResp.json();
-
-    const forms4 = filingsJson.filings.recent.accessionNumber
-      .map((acc, i) => ({
-        accession: acc.replace(/-/g, ""),
-        form: filingsJson.filings.recent.form[i],
-        filingDate: filingsJson.filings.recent.filingDate[i],
-      }))
-      .filter(f => f.form === "4")
-      .slice(0, 5); // keep it small + reliable
+    const cikListUrl =
+      "https://www.sec.gov/files/company_tickers.json";
+    const cikResp = await fetch(cikListUrl, { headers });
+    const cikData = await cikResp.json();
 
     const results = [];
+    let filingsChecked = 0;
 
-    // 2. Fetch each Form 4 XML and extract purchases
-    for (const filing of forms4) {
-      const xmlUrl = `https://www.sec.gov/Archives/edgar/data/320193/${filing.accession}/xslF345X03/primary_doc.xml`;
+    for (const key of Object.keys(cikData)) {
+      if (results.length >= 20) break; // keep runtime safe
 
-      const xmlResp = await fetch(xmlUrl, { headers });
-      const xml = await xmlResp.text();
+      const cik = cikData[key].cik_str.toString().padStart(10, "0");
 
-      // Only look for PURCHASE transactions
-      if (!xml.includes("<transactionCode>P</transactionCode>")) continue;
+      const submissionsUrl = `https://data.sec.gov/submissions/CIK${cik}.json`;
+      const subResp = await fetch(submissionsUrl, { headers });
+      if (!subResp.ok) continue;
 
-      results.push({
-        companyName: "Apple Inc",
-        ticker: "AAPL",
-        insiderName: "Unknown Insider",
-        insiderTitle: "Officer / Director",
-        shares: 1000,
-        pricePerShare: 150,
-        totalValue: 150000,
-        transactionDate: filing.filingDate,
-        sourceAccession: filing.accession,
-      });
+      const sub = await subResp.json();
+      const recent = sub.filings?.recent;
+      if (!recent) continue;
+
+      for (let i = 0; i < recent.form.length; i++) {
+        if (recent.form[i] !== "4") continue;
+
+        const filingDate = new Date(recent.filingDate[i]);
+        if (filingDate < cutoff) continue;
+
+        filingsChecked++;
+
+        const accession = recent.accessionNumber[i].replace(/-/g, "");
+        const xmlUrl = `https://www.sec.gov/Archives/edgar/data/${parseInt(
+          cik
+        )}/${accession}/${recent.primaryDocument[i]}`;
+
+        const xmlResp = await fetch(xmlUrl, { headers });
+        if (!xmlResp.ok) continue;
+
+        const xml = await xmlResp.text();
+
+        // only open market buys
+        if (!xml.includes("<transactionCode>P</transactionCode>")) continue;
+
+        const sharesMatch = xml.match(
+          /<transactionShares>[\s\S]*?<value>(.*?)<\/value>/
+        );
+        const priceMatch = xml.match(
+          /<transactionPricePerShare>[\s\S]*?<value>(.*?)<\/value>/
+        );
+        const nameMatch = xml.match(/<issuerName>(.*?)<\/issuerName>/);
+        const insiderMatch = xml.match(/<rptOwnerName>(.*?)<\/rptOwnerName>/);
+
+        const shares = sharesMatch ? Number(sharesMatch[1]) : null;
+        const price = priceMatch ? Number(priceMatch[1]) : null;
+
+        if (!shares || !price) continue;
+
+        results.push({
+          id: accession,
+          companyName: nameMatch ? nameMatch[1] : "Unknown",
+          ticker: sub.tickers?.[0] || "UNKNOWN",
+          insiderName: insiderMatch ? insiderMatch[1] : "Unknown",
+          insiderTitle: "Insider",
+          shares,
+          pricePerShare: price,
+          totalValue: shares * price,
+          transactionDate: recent.filingDate[i],
+        });
+      }
     }
 
     return res.status(200).json({
       lookbackDays: LOOKBACK_DAYS,
-      filingsChecked: forms4.length,
+      filingsChecked,
+      count: results.length,
       results,
     });
   } catch (err) {
