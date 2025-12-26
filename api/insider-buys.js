@@ -103,7 +103,7 @@ function numVal(v) {
   return Number.isFinite(n) ? n : null;
 }
 
-// IMPORTANT: fast-xml-parser sometimes stores text under "#text"
+// fast-xml-parser sometimes stores text under "#text"
 function textVal(node) {
   if (node === null || node === undefined) return null;
   if (typeof node === "string" || typeof node === "number") return String(node);
@@ -114,7 +114,7 @@ function textVal(node) {
   return null;
 }
 
-function parseForm4Purchases(xmlTextRaw, debugCapture = null) {
+function parseForm4Buys(xmlTextRaw, allowedCodesSet, debugCapture = null) {
   const xmlText = stripNamespaces(xmlTextRaw);
   const parser = new XMLParser({
     ignoreAttributes: false,
@@ -179,7 +179,7 @@ function parseForm4Purchases(xmlTextRaw, debugCapture = null) {
     debugCapture.codes = codes;
   }
 
-  const purchases = [];
+  const buys = [];
 
   for (const t of txs) {
     const code = safeText(
@@ -188,8 +188,7 @@ function parseForm4Purchases(xmlTextRaw, debugCapture = null) {
         ""
     );
 
-    // "P" = open market / purchase
-    if (code !== "P") continue;
+    if (!allowedCodesSet.has(code)) continue;
 
     const shares = numVal(
       textVal(t?.transactionAmounts?.transactionShares) ??
@@ -208,21 +207,23 @@ function parseForm4Purchases(xmlTextRaw, debugCapture = null) {
         textVal(t?.transactionDate) ?? textVal(t?.transactionDate?.value) ?? null
       ) || null;
 
-    if (!Number.isFinite(shares) || !Number.isFinite(price)) continue;
+    // Some codes may not have price; keep P strict, allow others if shares exist.
+    if (!Number.isFinite(shares)) continue;
 
-    purchases.push({
+    buys.push({
       issuerTradingSymbol,
       issuerName,
       ownerName,
       officerTitle,
       shares,
-      pricePerShare: price,
+      pricePerShare: Number.isFinite(price) ? price : null,
       transactionDate: date,
-      totalValue: Math.round(shares * price),
+      totalValue: Number.isFinite(price) ? Math.round(shares * price) : null,
+      code,
     });
   }
 
-  return purchases;
+  return buys;
 }
 
 async function fetchAtomPage({ start, headers }) {
@@ -231,94 +232,6 @@ async function fetchAtomPage({ start, headers }) {
     `action=getcurrent&type=4&count=100&start=${start}&output=atom`;
   const resp = await fetch(url, { headers });
   return { resp, url };
-}
-
-// Demo/seed data (ONLY when mode=seed)
-function seedRows() {
-  const today = new Date();
-  const daysAgo = (n) => {
-    const d = new Date(today);
-    d.setDate(d.getDate() - n);
-    return d.toISOString().slice(0, 10);
-  };
-
-  return [
-    {
-      id: "cook-nke-2025-12-22",
-      insiderName: "Timothy D. Cook",
-      insiderTitle: "CEO",
-      employerTicker: "AAPL",
-      employerCompany: "Apple Inc.",
-      purchasedTicker: "NKE",
-      purchasedCompany: "Nike Inc.",
-      shares: 50000,
-      pricePerShare: 103.25,
-      totalValue: 5162500,
-      transactionDate: "2025-12-22",
-      signalScore: 92,
-      purchaseType: "external",
-    },
-    {
-      id: "nadella-msft-2025-12-21",
-      insiderName: "Satya Nadella",
-      insiderTitle: "CEO",
-      employerTicker: "MSFT",
-      employerCompany: "Microsoft Corp.",
-      purchasedTicker: "MSFT",
-      purchasedCompany: "Microsoft Corp.",
-      shares: 25000,
-      pricePerShare: 412.15,
-      totalValue: 10303750,
-      transactionDate: "2025-12-21",
-      signalScore: 88,
-      purchaseType: "own-company",
-    },
-    {
-      id: "demo-1",
-      insiderName: "Jane Doe",
-      insiderTitle: "CFO",
-      employerTicker: "DEMO",
-      employerCompany: "Demo Holdings",
-      purchasedTicker: "DEMO",
-      purchasedCompany: "Demo Holdings",
-      shares: 12000,
-      pricePerShare: 27.4,
-      totalValue: 328800,
-      transactionDate: daysAgo(4),
-      signalScore: 74,
-      purchaseType: "own-company",
-    },
-    {
-      id: "demo-2",
-      insiderName: "John Smith",
-      insiderTitle: "Director",
-      employerTicker: "ACME",
-      employerCompany: "Acme Corp.",
-      purchasedTicker: "ACME",
-      purchasedCompany: "Acme Corp.",
-      shares: 8000,
-      pricePerShare: 55.1,
-      totalValue: 440800,
-      transactionDate: daysAgo(9),
-      signalScore: 67,
-      purchaseType: "own-company",
-    },
-    {
-      id: "demo-3",
-      insiderName: "Alex Kim",
-      insiderTitle: "CEO",
-      employerTicker: "RIVR",
-      employerCompany: "River Tech",
-      purchasedTicker: "RIVR",
-      purchasedCompany: "River Tech",
-      shares: 20000,
-      pricePerShare: 14.75,
-      totalValue: 295000,
-      transactionDate: daysAgo(12),
-      signalScore: 59,
-      purchaseType: "own-company",
-    },
-  ];
 }
 
 export default async function handler(req, res) {
@@ -334,11 +247,23 @@ export default async function handler(req, res) {
   }
 
   const debug = String(req.query.debug || "") === "1";
-  const mode = safeText(req.query.mode || ""); // "seed" to force demo
-  const v = safeText(req.query.v || ""); // cache buster
+  const v = safeText(req.query.v || "");
 
   const limit = clamp(toInt(req.query.limit, 25), 1, 50);
   const days = clamp(toInt(req.query.days, 30), 1, 365);
+
+  // NEW: allowed transaction codes (comma-separated), default = P only
+  // Examples:
+  // codes=P          (open-market purchases only)
+  // codes=P,M        (include option exercises / acquisitions)
+  // codes=P,M,A      (broader)
+  const codesParam = safeText(req.query.codes || "P");
+  const allowedCodes = new Set(
+    codesParam
+      .split(",")
+      .map((s) => s.trim().toUpperCase())
+      .filter(Boolean)
+  );
 
   // SAFE defaults for serverless
   const pages = clamp(toInt(req.query.pages, 1), 1, 3);
@@ -349,7 +274,7 @@ export default async function handler(req, res) {
   const startedAt = Date.now();
   const timeLeft = () => TIME_BUDGET_MS - (Date.now() - startedAt);
 
-  const cacheKey = `limit=${limit}|days=${days}|pages=${pages}|scan=${scanCap}|throttle=${betweenCallsMs}|budget=${TIME_BUDGET_MS}|mode=${mode}|v=${v}`;
+  const cacheKey = `limit=${limit}|days=${days}|pages=${pages}|scan=${scanCap}|throttle=${betweenCallsMs}|budget=${TIME_BUDGET_MS}|codes=${[...allowedCodes].sort().join(",")}|v=${v}`;
   const now = Date.now();
   const cacheTtlMs = 5 * 60 * 1000;
 
@@ -362,18 +287,19 @@ export default async function handler(req, res) {
       debug
         ? {
             data: memCache.data,
-            debug: { cache: "mem-hit", limit, days, pages, scanCap, throttle: betweenCallsMs, budget: TIME_BUDGET_MS },
+            debug: {
+              cache: "mem-hit",
+              limit,
+              days,
+              pages,
+              scanCap,
+              throttle: betweenCallsMs,
+              budget: TIME_BUDGET_MS,
+              codes: [...allowedCodes],
+            },
           }
         : memCache.data
     );
-  }
-
-  if (mode === "seed") {
-    const data = seedRows().slice(0, limit);
-    memCache.ts = Date.now();
-    memCache.key = cacheKey;
-    memCache.data = data;
-    return res.status(200).json(debug ? { data, debug: { cache: "seed", limit } } : data);
   }
 
   const headers = {
@@ -465,38 +391,47 @@ export default async function handler(req, res) {
         const xmlText = await xmlResp.text();
 
         const dbg = debug ? {} : null;
-        const purchases = parseForm4Purchases(xmlText, dbg);
+        const buys = parseForm4Buys(xmlText, allowedCodes, dbg);
 
         if (debug && samples.length < 15) {
           samples.push({
             idxUrl,
             xmlUrl,
             xmlName,
-            purchasesFound: purchases.length,
+            purchasesFound: buys.length,
             ...(dbg || {}),
           });
         }
 
-        for (const pch of purchases) {
-          const dt = pch.transactionDate || isoDateOnly(updated);
-          const sym = pch.issuerTradingSymbol || "—";
-          const nm = pch.ownerName || "—";
-          const id = `${nm}-${sym}-${dt}-${Math.random().toString(16).slice(2)}`;
+        for (const b of buys) {
+          const dt = b.transactionDate || isoDateOnly(updated);
+          const sym = b.issuerTradingSymbol || "—";
+          const nm = b.ownerName || "—";
+          const id = `${nm}-${sym}-${dt}-${b.code}-${Math.random().toString(16).slice(2)}`;
+
+          const purchaseType =
+            b.code === "P"
+              ? "open-market"
+              : b.code === "M"
+              ? "option-exercise"
+              : b.code === "A"
+              ? "acquisition"
+              : `code-${b.code}`;
 
           out.push({
             id,
             insiderName: nm,
-            insiderTitle: pch.officerTitle || "—",
+            insiderTitle: b.officerTitle || "—",
             employerTicker: sym,
-            employerCompany: pch.issuerName || "—",
+            employerCompany: b.issuerName || "—",
             purchasedTicker: sym,
-            purchasedCompany: pch.issuerName || "—",
-            shares: pch.shares,
-            pricePerShare: pch.pricePerShare,
-            totalValue: pch.totalValue,
+            purchasedCompany: b.issuerName || "—",
+            shares: b.shares,
+            pricePerShare: b.pricePerShare ?? 0,
+            totalValue: b.totalValue ?? 0,
             transactionDate: dt,
             signalScore: 50,
-            purchaseType: "own-company",
+            purchaseType,
           });
 
           if (out.length >= limit) break;
@@ -509,8 +444,6 @@ export default async function handler(req, res) {
     if (out.length >= limit) break;
   }
 
-  // IMPORTANT CHANGE:
-  // Live mode returns LIVE DATA ONLY (even if empty).
   const finalData = out.slice(0, limit);
 
   memCache.ts = Date.now();
@@ -529,6 +462,7 @@ export default async function handler(req, res) {
         pages,
         throttle: betweenCallsMs,
         budget: TIME_BUDGET_MS,
+        codes: [...allowedCodes],
         timeSpentMs: Date.now() - startedAt,
         errorsSample,
         samples,
