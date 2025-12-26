@@ -1,25 +1,11 @@
 // api/insider-buys.js
-//
-// Fixes SEC 429 rate limiting by:
-// 1) Caching results in-memory for a TTL (default 10 minutes)
-// 2) Throttling outbound SEC requests (simple delay + concurrency=1)
-// 3) Serving stale cached data if SEC returns 429/403
-//
-// Query params:
-//   ?limit=50        default 25, max 200
-//   ?days=30         default 30, max 180
-//   ?debug=1         returns { data, debug } instead of just data
-//
-// Env:
-//   SEC_USER_AGENT = "Your Name your@email.com"
 
 const BASE_ATOM =
   "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&owner=only&count=100&output=atom";
 
 const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
-const REQUEST_DELAY_MS = 350; // throttle between SEC calls (tune 250-750)
+const REQUEST_DELAY_MS = 350;
 
-// --- simple module-level cache (works on warm Vercel lambdas) ---
 let cache = {
   ts: 0,
   key: "",
@@ -27,7 +13,6 @@ let cache = {
   debug: {},
 };
 
-// --- helpers ---
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -47,11 +32,25 @@ async function fetchText(url, headers) {
   const t = await r.text();
   return { ok: r.ok, status: r.status, text: t };
 }
+
 function extractTag(xml, tag) {
   const re = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i");
   const m = xml.match(re);
   return m ? m[1].trim() : null;
 }
+
+// IMPORTANT: Form 4 often nests values like <transactionCode><value>P</value></transactionCode>
+function extractTagValue(xml, tag) {
+  const inner = extractTag(xml, tag);
+  if (!inner) return null;
+
+  const v = extractTag(inner, "value");
+  if (v) return v.trim();
+
+  // fallback: strip any XML tags
+  return inner.replace(/<[^>]+>/g, "").trim() || null;
+}
+
 function extractAllEntries(atomXml) {
   const entries = [];
   const re = /<entry>([\s\S]*?)<\/entry>/gi;
@@ -98,30 +97,33 @@ async function fetchForm4Xml(indexUrl, indexHtml, headers) {
   if (!ok) throw new Error(`SEC XML fetch failed ${status}`);
   return text;
 }
+
 function parseTransactionsFromForm4Xml(form4Xml) {
   const txs = [];
   const re = /<nonDerivativeTransaction>([\s\S]*?)<\/nonDerivativeTransaction>/gi;
   let m;
   while ((m = re.exec(form4Xml))) {
     const block = m[1];
-    const code = extractTag(block, "transactionCode");
+
+    const code = extractTagValue(block, "transactionCode"); // <-- FIX
     if (String(code || "").toUpperCase() !== "P") continue;
 
-    const shares = extractTag(block, "transactionShares");
-    const price = extractTag(block, "transactionPricePerShare");
-    const date = extractTag(block, "transactionDate");
+    const sharesStr = extractTagValue(block, "transactionShares");
+    const priceStr = extractTagValue(block, "transactionPricePerShare");
+    const dateStr = extractTagValue(block, "transactionDate");
 
-    const sharesVal = shares ? Number(shares.replace(/,/g, "")) : null;
-    const priceVal = price ? Number(price.replace(/,/g, "")) : null;
+    const shares = sharesStr ? Number(String(sharesStr).replace(/,/g, "")) : null;
+    const pricePerShare = priceStr ? Number(String(priceStr).replace(/,/g, "")) : null;
 
     txs.push({
-      shares: Number.isFinite(sharesVal) ? sharesVal : null,
-      pricePerShare: Number.isFinite(priceVal) ? priceVal : null,
-      transactionDate: date ? String(date).trim() : null,
+      shares: Number.isFinite(shares) ? shares : null,
+      pricePerShare: Number.isFinite(pricePerShare) ? pricePerShare : null,
+      transactionDate: dateStr ? String(dateStr).trim() : null,
     });
   }
   return txs;
 }
+
 function computeSignalScore(totalValue, role) {
   let score = 50;
   if (typeof totalValue === "number") {
@@ -152,9 +154,12 @@ export default async function handler(req, res) {
   const cacheKey = `${limit}:${days}`;
   const now = Date.now();
 
-  // Serve fresh cache if available
   if (cache.key === cacheKey && now - cache.ts < CACHE_TTL_MS) {
-    if (debug) return res.status(200).json({ data: cache.data, debug: { ...cache.debug, cache: "hit-fresh" } });
+    if (debug)
+      return res.status(200).json({
+        data: cache.data,
+        debug: { ...cache.debug, cache: "hit-fresh" },
+      });
     return res.status(200).json(cache.data);
   }
 
@@ -167,10 +172,9 @@ export default async function handler(req, res) {
   const cutoffIso = daysAgoIso(days);
 
   try {
-    // 1) Atom feed
     const atom = await fetchText(BASE_ATOM, headers);
+
     if (!atom.ok) {
-      // If rate limited, serve stale cache if present
       if ((atom.status === 429 || atom.status === 403) && cache.data?.length) {
         if (debug) {
           return res.status(200).json({
@@ -187,22 +191,18 @@ export default async function handler(req, res) {
 
       return res.status(atom.status).json({
         error: `SEC Atom fetch failed (${atom.status})`,
-        hint:
-          "SEC rate limited you. Wait a few minutes and retry. Also keep limit small (25) while testing.",
+        hint: "SEC rate limited you. Wait a few minutes and retry.",
       });
     }
 
     const entries = extractAllEntries(atom.text);
-
-    // 2) Iterate entries slowly and build results
     const out = [];
     const errors = [];
 
     for (const entryXml of entries) {
       if (out.length >= limit) break;
 
-      const updated =
-        extractTag(entryXml, "updated") || extractTag(entryXml, "published");
+      const updated = extractTag(entryXml, "updated") || extractTag(entryXml, "published");
       if (updated && new Date(updated).toISOString() < cutoffIso) continue;
 
       const hrefs = extractLinksFromEntry(entryXml);
@@ -214,11 +214,13 @@ export default async function handler(req, res) {
         const form4Xml = await fetchForm4Xml(indexUrl, indexHtml, headers);
         if (!form4Xml) continue;
 
-        const issuerName = extractTag(form4Xml, "issuerName");
-        const issuerTradingSymbol = extractTag(form4Xml, "issuerTradingSymbol");
+        const issuerName = extractTagValue(form4Xml, "issuerName") || extractTag(form4Xml, "issuerName");
+        const issuerTradingSymbol =
+          extractTagValue(form4Xml, "issuerTradingSymbol") || extractTag(form4Xml, "issuerTradingSymbol");
 
-        const reportingOwnerName = extractTag(form4Xml, "rptOwnerName");
-        const officerTitle = extractTag(form4Xml, "officerTitle");
+        const reportingOwnerName = extractTagValue(form4Xml, "rptOwnerName") || extractTag(form4Xml, "rptOwnerName");
+        const officerTitle =
+          extractTagValue(form4Xml, "officerTitle") || extractTag(form4Xml, "officerTitle");
 
         const role = officerTitle || null;
 
@@ -233,11 +235,9 @@ export default async function handler(req, res) {
               : null;
 
           out.push({
-            id: `${(reportingOwnerName || "insider")
-              .toLowerCase()
-              .replace(/\s+/g, "-")}-${issuerTradingSymbol || "na"}-${
-              t.transactionDate || "na"
-            }`,
+            id: `${(reportingOwnerName || "insider").toLowerCase().replace(/\s+/g, "-")}-${
+              issuerTradingSymbol || "na"
+            }-${t.transactionDate || "na"}`,
             insiderName: reportingOwnerName || null,
             insiderTitle: role,
             employerTicker: issuerTradingSymbol || null,
@@ -254,18 +254,14 @@ export default async function handler(req, res) {
         }
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-
-        // If we get 429/403 mid-loop, stop and return what we have + cache it
         if (msg.includes(" 429") || msg.includes(" 403")) {
           errors.push({ indexUrl, message: msg });
           break;
         }
-
         errors.push({ indexUrl, message: msg });
       }
     }
 
-    // If we got *some* data, cache and return it
     if (out.length) {
       cache = {
         ts: now,
@@ -284,7 +280,6 @@ export default async function handler(req, res) {
       return res.status(200).json(out);
     }
 
-    // If no data but we have stale cache, serve it
     if (cache.data?.length) {
       if (debug) {
         return res.status(200).json({
@@ -300,7 +295,6 @@ export default async function handler(req, res) {
       return res.status(200).json(cache.data);
     }
 
-    // Otherwise, return empty with debug/errors
     if (debug) {
       return res.status(200).json({
         data: [],
@@ -316,7 +310,6 @@ export default async function handler(req, res) {
 
     return res.status(200).json([]);
   } catch (e) {
-    // If error but cached data exists, serve it
     if (cache.data?.length) {
       if (debug) {
         return res.status(200).json({
