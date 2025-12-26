@@ -1,28 +1,23 @@
 import { XMLParser } from "fast-xml-parser";
 
-const FEED_URL =
-  "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&owner=only&count=20&output=atom";
-
-const HEADERS = {
-  "User-Agent": "InsiderScope demo contact@example.com",
-  Accept: "application/xml",
-};
-
 const parser = new XMLParser({
   ignoreAttributes: false,
   attributeNamePrefix: "",
 });
 
-async function fetchXML(url) {
-  const r = await fetch(url, { headers: HEADERS });
-  if (!r.ok) throw new Error(`Fetch failed ${r.status}`);
-  return r.text();
-}
+const SEC_HEADERS = {
+  "User-Agent": "InsiderScope demo contact@example.com",
+  "Accept": "application/xml,text/xml",
+};
 
 export default async function handler(req, res) {
   try {
-    const feedXML = await fetchXML(FEED_URL);
-    const feed = parser.parse(feedXML);
+    const feedUrl =
+      "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&owner=only&count=40&output=atom";
+
+    const feedRes = await fetch(feedUrl, { headers: SEC_HEADERS });
+    const feedText = await feedRes.text();
+    const feed = parser.parse(feedText);
 
     const entries = Array.isArray(feed.feed.entry)
       ? feed.feed.entry
@@ -30,65 +25,64 @@ export default async function handler(req, res) {
 
     const results = [];
 
-    for (const entry of entries) {
-      const filingUrl = entry.link?.href;
-      if (!filingUrl) continue;
+    for (const entry of entries.slice(0, 15)) {
+      const accessionUrl = entry.link.href.replace("-index.htm", ".xml");
 
-      // Load filing page
-      const filingPage = await fetchXML(filingUrl);
+      try {
+        const filingRes = await fetch(accessionUrl, { headers: SEC_HEADERS });
+        const filingText = await filingRes.text();
+        const filing = parser.parse(filingText);
 
-      // Find XML document link
-      const xmlMatch = filingPage.match(
-        /href="([^"]+\.xml)"/i
-      );
-      if (!xmlMatch) continue;
+        const doc = filing.ownershipDocument;
+        if (!doc) continue;
 
-      const xmlUrl = `https://www.sec.gov${xmlMatch[1]}`;
-      const formXML = await fetchXML(xmlUrl);
-      const form = parser.parse(formXML);
+        const issuer = doc.issuer || {};
+        const owner = doc.reportingOwner || {};
+        const txns =
+          doc.nonDerivativeTable?.nonDerivativeTransaction || [];
 
-      const issuer = form?.ownershipDocument?.issuer;
-      const reportingOwner =
-        form?.ownershipDocument?.reportingOwner?.reportingOwnerId;
+        const txnList = Array.isArray(txns) ? txns : [txns];
 
-      const transactions =
-        form?.ownershipDocument?.nonDerivativeTable?.nonDerivativeTransaction;
+        for (const t of txnList) {
+          if (
+            t.transactionCoding?.transactionCode !== "P" ||
+            t.transactionAmounts?.transactionAcquiredDisposedCode?.value !== "A"
+          ) {
+            continue;
+          }
 
-      const txns = Array.isArray(transactions)
-        ? transactions
-        : transactions
-        ? [transactions]
-        : [];
+          const shares = Number(
+            t.transactionAmounts?.transactionShares?.value || 0
+          );
+          const price = Number(
+            t.transactionAmounts?.transactionPricePerShare?.value || 0
+          );
 
-      for (const t of txns) {
-        if (t.transactionCoding?.transactionCode !== "P") continue;
+          if (shares <= 0 || price <= 0) continue;
 
-        const shares = Number(
-          t.transactionAmounts?.transactionShares?.value || 0
-        );
-        const price = Number(
-          t.transactionAmounts?.transactionPricePerShare?.value || 0
-        );
-
-        results.push({
-          id: entry.id,
-          companyName: issuer?.issuerName || "Unknown",
-          ticker: issuer?.issuerTradingSymbol || "UNKNOWN",
-          insiderName:
-            reportingOwner?.rptOwnerName || "Unknown",
-          insiderTitle: "Insider",
-          shares,
-          pricePerShare: price,
-          totalValue: shares * price,
-          transactionDate: entry.updated,
-        });
+          results.push({
+            id: entry.id,
+            companyName: issuer.issuerName || "Unknown",
+            ticker: issuer.issuerTradingSymbol || "UNKNOWN",
+            insiderName:
+              owner.reportingOwnerId?.rptOwnerName || "Unknown",
+            insiderTitle:
+              owner.reportingOwnerRelationship?.officerTitle ||
+              "Insider",
+            shares,
+            pricePerShare: price,
+            totalValue: shares * price,
+            transactionDate:
+              t.transactionDate?.value || entry.updated,
+          });
+        }
+      } catch {
+        continue;
       }
     }
 
-    results.sort((a, b) => b.totalValue - a.totalValue);
     res.status(200).json(results);
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to load Form 4 data" });
+    res.status(500).json({ error: err.message });
   }
 }
