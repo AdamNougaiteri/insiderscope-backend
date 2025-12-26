@@ -1,52 +1,26 @@
-// /api/insider-buys.js
-
-import { XMLParser } from "fast-xml-parser";
-
-const parser = new XMLParser({ ignoreAttributes: false });
-
-const SEC_HEADERS = {
-  "User-Agent": "InsiderScope demo contact@example.com",
-  Accept: "application/xml",
-};
-
 export default async function handler(req, res) {
   try {
-    const feedUrl =
-      "https://www.sec.gov/Archives/edgar/usgaap.rss.xml";
+    const SEC_URL =
+      "https://data.sec.gov/submissions/CIK0000320193.json"; // example CIK (Apple)
 
-    const feedResponse = await fetch(feedUrl, {
-      headers: SEC_HEADERS,
+    const response = await fetch(SEC_URL, {
+      headers: {
+        "User-Agent": "InsiderScope demo contact@example.com",
+        Accept: "application/json",
+      },
     });
 
-    if (!feedResponse.ok) {
-      throw new Error("Failed to fetch SEC feed");
-    }
+    const json = await response.json();
 
-    const xml = await feedResponse.text();
-    const parsed = parser.parse(xml);
-
-    const items = parsed?.rss?.channel?.item || [];
-
-    const results = items
-      .filter((item) =>
-        item?.title?.toLowerCase().includes("form 4")
-      )
-      .slice(0, 25)
-      .map((item, index) => ({
-        id: `sec-${index}`,
-        companyName: item?.title || "Unknown Company",
-        ticker: "UNKNOWN",
-        insiderName: "Insider",
-        insiderTitle: "Insider",
-        shares: 0,
-        pricePerShare: 0,
-        totalValue: 0,
-        transactionDate: item?.pubDate || new Date().toISOString(),
-      }));
-
-    res.status(200).json(results);
-  } catch (error) {
-    console.error("SEC fetch error:", error);
-    res.status(200).json([]); // NEVER crash frontend
+    // TEMP: return raw SEC payload for inspection
+    return res.status(200).json({
+      debug: true,
+      source: "SEC submissions API",
+      keys: Object.keys(json),
+      recent: json?.filings?.recent ?? null,
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: err.message });
   }
 }
