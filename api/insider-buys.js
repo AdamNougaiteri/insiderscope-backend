@@ -5,7 +5,7 @@ export default async function handler(req, res) {
       Accept: "application/xml",
     };
 
-    // Fetch Form 4 Atom feed
+    // 1. Fetch Form 4 Atom feed
     const feedRes = await fetch(
       "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&owner=only&count=40&output=atom",
       { headers }
@@ -13,23 +13,23 @@ export default async function handler(req, res) {
 
     const feedText = await feedRes.text();
 
-    // Extract accession numbers
-    const accessionMatches = [
-      ...feedText.matchAll(/accession-number=([0-9-]+)/g),
-    ];
-    const accessionNumbers = accessionMatches.map(m => m[1]);
-
-    // Extract filing links (contain CIK)
-    const linkMatches = [
-      ...feedText.matchAll(/<link href="https:\/\/www\.sec\.gov\/Archives\/edgar\/data\/(\d+)\/([0-9-]+)\/"/g),
-    ];
+    // 2. Extract ALL filing URLs
+    const filingLinks = [
+      ...feedText.matchAll(
+        /href="(https:\/\/www\.sec\.gov\/Archives\/edgar\/data\/\d+\/[0-9-]+-index\.html)"/g
+      ),
+    ].map(m => m[1]);
 
     const results = [];
     const debug = [];
 
-    for (const match of linkMatches) {
-      const cik = match[1].padStart(10, "0");
-      const accession = match[2];
+    // 3. Iterate filings
+    for (const link of filingLinks) {
+      const parts = link.match(/data\/(\d+)\/([0-9-]+)-index\.html/);
+      if (!parts) continue;
+
+      const cik = parts[1].padStart(10, "0");
+      const accession = parts[2];
       const accessionNoDash = accession.replace(/-/g, "");
 
       try {
@@ -84,7 +84,7 @@ export default async function handler(req, res) {
     }
 
     return res.status(200).json({
-      accessionCount: accessionNumbers.length,
+      accessionCount: filingLinks.length,
       inspected: debug.length,
       count: results.length,
       results,
