@@ -1,34 +1,50 @@
 // api/insider-buys.js
 
-export default async function handler(req, res) {
-  return res.status(200).json([
+export default function handler(req, res) {
+  const data = [
     {
-      signalScore: 92,
-      purchasedTicker: "NKE",
-      purchasedCompany: "Nike Inc.",
+      id: "cook-nke-2025-12-22",
+
+      insiderName: "Timothy D. Cook",
+      insiderTitle: "CEO",
+
       employerTicker: "AAPL",
       employerCompany: "Apple Inc.",
-      insider: "Timothy D. Cook",
-      role: "CEO",
+
+      purchasedTicker: "NKE",
+      purchasedCompany: "Nike Inc.",
+
       shares: 50000,
-      price: 103.25,
-      value: 5162500,
-      filingDate: "2025-12-22",
-      purchaseType: "external"
+      pricePerShare: 103.25,
+      totalValue: 5162500,
+
+      transactionDate: "2025-12-22",
+
+      signalScore: 92,
+      purchaseType: "external",
     },
     {
-      signalScore: 88,
-      purchasedTicker: "MSFT",
-      purchasedCompany: "Microsoft Corp.",
+      id: "nadella-msft-2025-12-21",
+
+      insiderName: "Satya Nadella",
+      insiderTitle: "CEO",
+
       employerTicker: "MSFT",
       employerCompany: "Microsoft Corp.",
-      insider: "Satya Nadella",
-      role: "CEO",
+
+      purchasedTicker: "MSFT",
+      purchasedCompany: "Microsoft Corp.",
+
       shares: 25000,
-      price: 412.15,
-      value: 10303750,
-      filingDate: "2025-12-21",
-      purchaseType: "own-company"
-    }
-  ]);
+      pricePerShare: 412.15,
+      totalValue: 10303750,
+
+      transactionDate: "2025-12-21",
+
+      signalScore: 88,
+      purchaseType: "own-company",
+    },
+  ];
+
+  res.status(200).json(data);
 }
